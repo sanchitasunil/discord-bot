@@ -1,0 +1,68 @@
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -366,5 +366,12 @@ class VoiceReceiver:
+     MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
+     SAMPLE_RATE = 48000        # Discord native rate
+     CHANNELS = 2               # Discord sends stereo
++    # Peak int16 RMS below this is treated as background noise / room echo,
++    # not speech, and is discarded before it reaches Whisper. Whisper
++    # reliably hallucinates plausible-sounding sentences ("Gracias.", "Tell
++    # me something about births.") when fed quiet/non-speech audio, so this
++    # buffer must never reach STT. Mirrors tools/voice_mode.py's
++    # SILENCE_RMS_THRESHOLD used for the local-mic capture path.
++    MIN_SPEECH_RMS = 200
+ 
+     def __init__(self, voice_client, allowed_user_ids: set = None):
+@@ -676,8 +1229,51 @@ class VoiceReceiver:
+                     self._buffers.pop(ssrc, None)
+                     self._last_packet_time.pop(ssrc, None)
+ 
++        # Gate on actual loudness, not just packet timing: Discord relays
++        # background noise / room echo as real RTP packets, and forwarding
++        # that to Whisper produces confident hallucinated transcripts rather
++        # than an STT failure, so packet presence alone can't distinguish
++        # real speech from ambient noise.
++        completed = []
++        for user_id, pcm in candidates:
++            peak = self._peak_rms(pcm, self.CHANNELS)
++            if peak >= self.MIN_SPEECH_RMS:
++                completed.append((user_id, pcm))
++            else:
++                logger.debug(
++                    "Discarding quiet voice buffer from user %d (peak_rms=%d < %d) "
++                    "— treating as background noise, not speech",
++                    user_id, peak, self.MIN_SPEECH_RMS,
++                )
++
+         return completed
+ 
++    @staticmethod
++    def _peak_rms(pcm: bytes, channels: int, chunk_ms: float = 20.0, sample_rate: int = 48000) -> int:
++        """Return the loudest short-window int16 RMS in *pcm*.
++
++        Windowed rather than a single RMS over the whole buffer so a short
++        loud utterance surrounded by silence in the same buffer isn't
++        diluted into a false negative.
++        """
++        if not pcm:
++            return 0
++        import array
++
++        samples = array.array("h")
++        samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
++        frame_size = max(1, channels)
++        chunk_samples = max(1, int(sample_rate * chunk_ms / 1000)) * frame_size
++
++        peak = 0
++        for i in range(0, len(samples), chunk_samples):
++            chunk = samples[i:i + chunk_samples]
++            if not chunk:
++                continue
++            mean_sq = sum(s * s for s in chunk) / len(chunk)
++            peak = max(peak, int(mean_sq ** 0.5))
++        return peak
++
+     # ------------------------------------------------------------------
+     # PCM -> WAV conversion (for Whisper STT)
+     # ------------------------------------------------------------------

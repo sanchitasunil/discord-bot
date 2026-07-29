@@ -1,0 +1,20 @@
+# Secrets — never commit real values
+.env
+*.env
+!.env.example
+
+# Content-source doc (personal draft material, not for the repo)
+CONTENT_NOTES.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime logs and per-guild state the bot writes
+logs/
+*.log
+discord_voice_selection.json
+discord_command_sync_state.json
+sessions/
+state.db

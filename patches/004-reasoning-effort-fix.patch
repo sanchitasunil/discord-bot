@@ -1,0 +1,74 @@
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index f58aed0..26b791c 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -400,6 +400,42 @@ def grok_supports_reasoning_effort(model: str) -> bool:
+     return any(name.startswith(prefix) for prefix in _GROK_EFFORT_CAPABLE_PREFIXES)
+ 
+ 
++def openai_model_rejects_reasoning_effort(model: str) -> bool:
++    """Return True for OpenAI models that 400 on ``reasoning.effort``.
++
++    Two non-reasoning OpenAI families reject the Responses API's
++    ``reasoning.effort`` field ("Unsupported parameter: 'reasoning.effort'
++    is not supported with this model"):
++
++    1. The chat-tuned ``-chat`` variants — ``gpt-5-chat-latest``,
++       ``gpt-5.1-chat``, ``gpt-5.2-chat-latest`` (confirmed live 2026-07-23).
++    2. The GPT-4o family — ``gpt-4o``, ``gpt-4o-mini``, ``chatgpt-4o-latest``
++       (confirmed live 2026-07-29 via the real bot path: both 400 without
++       this gate). These are non-reasoning but lack the ``-chat`` substring,
++       so they were NOT caught before — a latent bug, since the function's
++       contract is "does this model reject reasoning.effort" and for gpt-4o
++       the answer is empirically yes.
++
++    The Responses transport (agent/transports/codex.py) otherwise attaches
++    ``reasoning.effort`` unconditionally for every non-xAI/non-GitHub model,
++    with no model-capability gate — unlike the Grok allowlist above.
++
++    Only the gpt-4o* / chatgpt-4o* families are matched by prefix (all 4o
++    models are non-reasoning; the reasoning OpenAI models are o1/o3 and the
++    gpt-5.x *non*-chat line, never gpt-4o). Substring for ``-chat`` since
++    aggregator-prefixed spellings (``openai/gpt-5-chat-latest``) and dated
++    snapshots (``gpt-4o-2024-11-20``) both need to match.
++    """
++    name = (model or "").strip().lower()
++    # Strip a common aggregator prefix so "openai/gpt-4o" matches too.
++    bare = name.rsplit("/", 1)[-1]
++    if "-chat" in name:
++        return True
++    if bare.startswith("gpt-4o") or bare.startswith("chatgpt-4o"):
++        return True
++    return False
++
++
+ _CONTEXT_LENGTH_KEYS = (
+     "context_length",
+     "context_window",
+diff --git a/agent/transports/codex.py b/agent/transports/codex.py
+index ef7ffba..baa94b2 100644
+--- a/agent/transports/codex.py
++++ b/agent/transports/codex.py
+@@ -293,10 +293,18 @@ class ResponsesApiTransport(ProviderTransport):
+                 if github_reasoning is not None:
+                     kwargs["reasoning"] = github_reasoning
+             else:
+-                kwargs["reasoning"] = {"effort": reasoning_effort, "summary": "auto"}
+-                kwargs["include"] = (
+-                    ["reasoning.encrypted_content"] if replay_encrypted_reasoning else []
+-                )
++                from agent.model_metadata import openai_model_rejects_reasoning_effort
++
++                # gpt-5-chat-latest and other "-chat" non-reasoning siblings
++                # 400 on reasoning.effort — this branch otherwise attaches
++                # it unconditionally for every model, with no capability
++                # gate (unlike the Grok allowlist above). See
++                # openai_model_rejects_reasoning_effort's docstring.
++                if not openai_model_rejects_reasoning_effort(model):
++                    kwargs["reasoning"] = {"effort": reasoning_effort, "summary": "auto"}
++                    kwargs["include"] = (
++                        ["reasoning.encrypted_content"] if replay_encrypted_reasoning else []
++                    )
+         elif not is_github_responses and not is_xai_responses:
+             kwargs["include"] = []
+ 

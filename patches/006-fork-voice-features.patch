@@ -1,0 +1,3008 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 9a2b9fd..7f306b0 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -5033,24 +5033,86 @@ class BasePlatformAdapter(ABC):
+                 # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
+                 # True globally and no ``/voice off`` has been issued.
+                 _tts_path = None
+-                if (self._should_auto_tts_for_chat(event.source.chat_id)
++                # Already spoken sentence-by-sentence as the agent generated
++                # it (see gateway/run.py's live-speech-streaming session) —
++                # re-synthesizing and speaking the full text again here
++                # would duplicate it.
++                _tts_spoken_live = bool(getattr(event, "_voice_already_spoken_live", False))
++                if (not _tts_spoken_live
++                        and self._should_auto_tts_for_chat(event.source.chat_id)
+                         and event.message_type == MessageType.VOICE
+                         and text_content
+                         and not media_files):
+-                    try:
+-                        from tools.tts_tool import text_to_speech_tool, check_tts_requirements
+-                        if check_tts_requirements():
+-                            import json as _json
+-                            speech_text = self.prepare_tts_text(text_content)
++                    speech_text = self.prepare_tts_text(text_content)
++                    # Try live-streaming playback first (Discord: pipes the
++                    # TTS backend's audio straight into the active voice/
++                    # stage connection as it's generated). Only when that's
++                    # unavailable or declines (no live connection for this
++                    # chat, provider doesn't stream) do we fall back to the
++                    # old generate-a-whole-file-then-play path below, which
++                    # pays for the entire clip's synthesis time before any
++                    # sound comes out.
++                    if speech_text and hasattr(self, "speak_live"):
++                        try:
++                            _tts_spoken_live = await self.speak_live(event.source.chat_id, speech_text)
++                        except Exception as live_err:
++                            logger.warning("[%s] speak_live failed: %s", self.name, live_err)
++                    if not _tts_spoken_live:
++                        try:
+                             if not speech_text:
+                                 raise ValueError("Empty text after markdown cleanup")
+-                            tts_result_str = await asyncio.to_thread(
+-                                text_to_speech_tool, text=speech_text
++
++                            # A per-guild voice (via /voice set, or the
++                            # conversational switch marker) only ever
++                            # reached the live voice-channel streaming
++                            # path — this file-attachment fallback always
++                            # used the global tts.voice/MURF_DEFAULT_VOICE
++                            # default regardless, since text_to_speech_tool
++                            # has no concept of "which guild". Check for an
++                            # override first and synthesize directly with
++                            # it, bypassing the generic tool only when one
++                            # is actually set.
++                            guild_voice = (
++                                self.resolve_chat_guild_voice(event.source.chat_id)
++                                if hasattr(self, "resolve_chat_guild_voice") else None
+                             )
+-                            tts_data = _json.loads(tts_result_str)
+-                            _tts_path = tts_data.get("file_path")
+-                    except Exception as tts_err:
+-                        logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
++                            if guild_voice:
++                                from tools.tts_tool import _load_tts_config, _get_provider
++                                from agent.tts_registry import get_provider as _get_tts_plugin_provider
++                                from hermes_cli.plugins import _ensure_plugins_discovered
++                                import tempfile
++                                import uuid as _uuid
++
++                                tts_config = _load_tts_config()
++                                provider_name = _get_provider(tts_config)
++                                _ensure_plugins_discovered()
++                                provider = _get_tts_plugin_provider(provider_name)
++                                if provider is None:
++                                    _ensure_plugins_discovered(force=True)
++                                    provider = _get_tts_plugin_provider(provider_name)
++                                if provider is not None:
++                                    candidate_path = os.path.join(
++                                        tempfile.gettempdir(), "hermes_voice",
++                                        f"tts_reply_{_uuid.uuid4().hex[:12]}.mp3",
++                                    )
++                                    os.makedirs(os.path.dirname(candidate_path), exist_ok=True)
++                                    await asyncio.to_thread(
++                                        provider.synthesize, speech_text, candidate_path,
++                                        voice=guild_voice,
++                                    )
++                                    _tts_path = candidate_path
++
++                            if _tts_path is None:
++                                from tools.tts_tool import text_to_speech_tool, check_tts_requirements
++                                if check_tts_requirements():
++                                    import json as _json
++                                    tts_result_str = await asyncio.to_thread(
++                                        text_to_speech_tool, text=speech_text
++                                    )
++                                    tts_data = _json.loads(tts_result_str)
++                                    _tts_path = tts_data.get("file_path")
++                        except Exception as tts_err:
++                            logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
+ 
+                 # Play TTS audio before text (voice-first experience)
+                 _tts_caption_delivered = False
+@@ -5169,11 +5231,26 @@ class BasePlatformAdapter(ABC):
+                     try:
+                         ext = Path(media_path).suffix.lower()
+                         if should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
+-                            media_result = await self.send_voice(
+-                                chat_id=event.source.chat_id,
+-                                audio_path=media_path,
+-                                metadata=_final_thread_metadata,
+-                            )
++                            # is_voice audio came from the TTS tool
++                            # ([[audio_as_voice]]) rather than a plain audio
++                            # attachment. play_tts() routes it into a live
++                            # voice/stage connection when one is active for
++                            # this chat (falling back to send_voice
++                            # otherwise) — send_voice() alone would always
++                            # post it as a chat attachment even while
++                            # connected, silently skipping actual playback.
++                            if is_voice:
++                                media_result = await self.play_tts(
++                                    chat_id=event.source.chat_id,
++                                    audio_path=media_path,
++                                    metadata=_final_thread_metadata,
++                                )
++                            else:
++                                media_result = await self.send_voice(
++                                    chat_id=event.source.chat_id,
++                                    audio_path=media_path,
++                                    metadata=_final_thread_metadata,
++                                )
+                         elif ext in _VIDEO_EXTS:
+                             media_result = await self.send_video(
+                                 chat_id=event.source.chat_id,
+diff --git a/gateway/run.py b/gateway/run.py
+index 9e2b434..5ec2aa3 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -1866,6 +1866,127 @@ from gateway.whatsapp_identity import (
+ logger = logging.getLogger(__name__)
+ 
+ 
++# Lets the agent switch or preview a Murf voice, or switch the spoken
++# language, from plain conversation without a formal tool call — the model
++# emits one of these markers in its reply, the gateway resolves it and
++# strips the tag before the text is shown or spoken.
++#   [[SWITCH_VOICE: q]]    persist a new guild voice        (handled post-turn)
++#   [[SAMPLE_VOICE: q]]    one-off preview of a voice       (handled post-turn)
++#   [[SPEAK_LANGUAGE: q]]  transient per-turn language switch (handled live, mid-stream)
++# Mirrors the existing MEDIA:/[[audio_as_voice]] tag-interception pattern.
++_VOICE_SWITCH_TAG_RE = re.compile(
++    r"\[\[(SWITCH_VOICE|SAMPLE_VOICE|SPEAK_LANGUAGE):\s*([^\]]+)\]\]", re.IGNORECASE
++)
++
++# Language switching rides on en-IN-anisha's MultiNative capability: these
++# are the locales that voice can speak natively (verified live against the
++# Murf Falcon catalog 2026-07-27 — en-IN-anisha.supportedLocales). Switching
++# to any of these needs only a locale change on the same voice, no reconnect
++# (see MurfLiveSession.switch). Kept as a constant so the hot streaming path
++# never makes a network round-trip to resolve a language. Note: Telugu
++# (te-IN), Odia (or-IN) and Assamese (as-IN) have NO standalone Falcon voice
++# but Anisha speaks them, which is exactly why we route language switching
++# through her rather than hunting per-language native voices.
++_ANISHA_LOCALES = frozenset({
++    "ml-IN", "te-IN", "pa-IN", "as-IN", "or-IN", "ta-IN",
++    "bn-IN", "hi-IN", "kn-IN", "mr-IN", "en-IN",
++})
++_LANGUAGE_SWITCH_VOICE = "en-IN-anisha"
++
++# Speaker label used for the bot's own turns in the voice-session recap log
++# (Feature 2). Distinct from any human speaker name so recap can separate
++# questions (humans) from answers (bot).
++_RECAP_BOT_SPEAKER = "Murf bot"
++_LANGUAGE_TO_LOCALE = {
++    "english": "en-IN", "hindi": "hi-IN", "tamil": "ta-IN",
++    "bengali": "bn-IN", "bangla": "bn-IN", "telugu": "te-IN",
++    "malayalam": "ml-IN", "kannada": "kn-IN", "marathi": "mr-IN",
++    "punjabi": "pa-IN", "odia": "or-IN", "oriya": "or-IN", "assamese": "as-IN",
++}
++
++
++def _resolve_language_locale(query: str) -> Optional[str]:
++    """Map a ``[[SPEAK_LANGUAGE: q]]`` query to a Murf locale Anisha can
++    speak, or None if it isn't a supported language. Accepts a language
++    name ("Hindi", "tamil") or a raw locale ("hi-IN"). Unsupported
++    languages (Gujarati, French, etc.) return None on purpose — SOUL.md
++    tells the model to decline those in English rather than emit the tag.
++    """
++    q = (query or "").strip().lower()
++    if not q:
++        return None
++    locale = _LANGUAGE_TO_LOCALE.get(q)
++    if locale is None:
++        # allow a raw locale like "hi-IN"
++        for loc in _ANISHA_LOCALES:
++            if loc.lower() == q:
++                locale = loc
++                break
++    if locale and locale in _ANISHA_LOCALES:
++        return locale
++    return None
++
++
++class _MarkerDeltaFilter:
++    """Buffers raw token deltas so a ``[[SWITCH_VOICE: ...]]``/
++    ``[[SAMPLE_VOICE: ...]]`` marker can never reach a live delivery sink
++    (the streamed Discord message text, or the sentence-by-sentence TTS
++    feed) even partially, while it's still being generated token-by-token.
++
++    The three existing marker-stripping call sites (final response text,
++    interim/commentary messages, and the live-speech trailing flush) only
++    ever see a *complete* string, so a simple regex substitution is enough
++    there. This is the fourth path — raw incremental deltas handed to
++    ``GatewayStreamConsumer.on_delta``/the live-speech sentence feed as
++    the model generates them — and a regex can't help mid-generation: by
++    the time ``]]`` arrives to complete the match, the ``[[SAMPLE_VOICE:``
++    prefix has already been forwarded and displayed/spoken. Confirmed in
++    practice: the raw tag showed up verbatim in the Discord message text.
++
++    Everything before an unclosed ``[[`` is forwarded immediately (so
++    normal streaming latency is unaffected); text from ``[[`` onward is
++    held back until a matching ``]]`` arrives, then either dropped (and
++    handed to *on_marker* for side-effect handling) if it's a real marker,
++    or forwarded as plain text if it happens not to be.
++    """
++
++    def __init__(self, on_output, on_marker):
++        self._buf = ""
++        self._on_output = on_output
++        self._on_marker = on_marker
++
++    def feed(self, delta: str) -> None:
++        if not delta:
++            return
++        self._buf += delta
++        while True:
++            start = self._buf.find("[[")
++            if start == -1:
++                if self._buf:
++                    self._on_output(self._buf)
++                    self._buf = ""
++                return
++            if start > 0:
++                self._on_output(self._buf[:start])
++                self._buf = self._buf[start:]
++            end = self._buf.find("]]")
++            if end == -1:
++                # Marker still incomplete — hold back and wait for more.
++                return
++            candidate = self._buf[:end + 2]
++            self._buf = self._buf[end + 2:]
++            if _VOICE_SWITCH_TAG_RE.fullmatch(candidate):
++                self._on_marker(candidate)
++            else:
++                self._on_output(candidate)
++
++    def flush(self) -> None:
++        """Forward whatever's left unresolved (e.g. stream ended mid-tag)."""
++        if self._buf:
++            self._on_output(self._buf)
++            self._buf = ""
++
++
+ _OWN_POLICY_OPEN_ENV = {
+     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
+     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
+@@ -3372,6 +3493,98 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         except OSError as e:
+             logger.warning("Failed to save voice modes: %s", e)
+ 
++    async def _apply_voice_switch_marker(self, source: SessionSource, text: str) -> str:
++        """Detect a ``[[SWITCH_VOICE: query]]`` / ``[[SAMPLE_VOICE: query]]``
++        marker the agent can emit when a user asks — in plain conversation,
++        not a slash command — to change or preview the Murf voice.
++        Resolves *query* against the real voice catalog, applies it
++        (persists as the guild's voice for SWITCH; plays a one-off preview
++        for SAMPLE, without persisting), and returns *text* with the
++        marker stripped either way. Returns *text* unchanged if there's no
++        marker, the platform isn't Discord, or nothing matches — this is
++        always safe to call on any response.
++        """
++        match = _VOICE_SWITCH_TAG_RE.search(text)
++        if not match or source.platform != Platform.DISCORD:
++            return text
++        cleaned = _VOICE_SWITCH_TAG_RE.sub("", text).strip()
++        # group(1) is the full verb (SWITCH_VOICE / SAMPLE_VOICE /
++        # SPEAK_LANGUAGE); reduce to the action word.
++        verb, query = match.group(1).upper(), match.group(2).strip()
++        action = verb.split("_")[0]  # SWITCH | SAMPLE | SPEAK
++
++        # SPEAK_LANGUAGE is handled live mid-stream (see _handle_language_marker
++        # in _run_agent_inner); by the time it could reach this post-turn
++        # resolver the reply is already spoken, so here we only strip it.
++        if action == "SPEAK":
++            return cleaned
++
++        adapter = self.adapters.get(Platform.DISCORD)
++        if adapter is None:
++            return cleaned
++        vtc = getattr(adapter, "_voice_text_channels", None)
++        guild_id = None
++        if isinstance(vtc, dict):
++            for gid, tc in vtc.items():
++                if str(tc) == str(source.chat_id):
++                    guild_id = gid
++                    break
++        if guild_id is None:
++            # Not currently connected to voice for any guild linked to this
++            # channel — SWITCH_VOICE should still work from plain text chat,
++            # since it's just a persisted per-guild preference, not
++            # something that requires an active voice session (confirmed
++            # gap: a user asking "switch to X" in a text channel with no
++            # live voice connection got told the bot "can't flip the voice
++            # from here" and offered API/Studio instructions instead, since
++            # this whole mechanism had no way to resolve a guild at all).
++            # Resolve the guild directly from the channel instead.
++            client = getattr(adapter, "_client", None)
++            try:
++                channel = client.get_channel(int(source.chat_id)) if client else None
++                guild = getattr(channel, "guild", None)
++                if guild is not None:
++                    guild_id = guild.id
++            except (TypeError, ValueError, AttributeError):
++                pass
++        if guild_id is None:
++            return cleaned
++
++        try:
++            provider, voices = self._resolve_murf_provider_and_voices()
++            if provider is None:
++                return cleaned
++            voice_match, _candidates = self._match_voice_query(query, voices)
++            if voice_match is None:
++                return cleaned
++            # Strip the "(F)"/"(M)" suffix from the display name before
++            # speaking it — that's meant for text lists, not to be read
++            # aloud literally as "Alina F" mid-sentence.
++            spoken_name = re.sub(
++                r"\s*\([MF]\)\s*$", "", str(voice_match.get("display") or voice_match["id"]),
++            )
++            if action == "SWITCH" and hasattr(adapter, "set_guild_voice"):
++                adapter.set_guild_voice(guild_id, voice_match["id"])
++                # Confirm the switch by actually speaking in the new voice —
++                # the model's own text (before the tag) just says it's
++                # switching, this is the audible proof it happened, in the
++                # voice itself. Not a question back to the user.
++                if hasattr(adapter, "speak_live"):
++                    await adapter.speak_live(
++                        str(source.chat_id),
++                        f"Hey, this is {spoken_name}.",
++                        voice_override=voice_match["id"],
++                    )
++            elif action == "SAMPLE" and hasattr(adapter, "speak_live"):
++                await adapter.speak_live(
++                    str(source.chat_id),
++                    f"Here's how {spoken_name} sounds.",
++                    voice_override=voice_match["id"],
++                )
++        except Exception as exc:
++            logger.debug("Voice switch marker handling failed: %s", exc)
++        return cleaned
++
+     def _set_adapter_auto_tts_disabled(self, adapter, chat_id: str, disabled: bool) -> None:
+         """Update an adapter's in-memory auto-TTS suppression set if present."""
+         disabled_chats = getattr(adapter, "_auto_tts_disabled_chats", None)
+@@ -12028,7 +12241,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 moa_config=getattr(event, "_moa_config", None),
+                 persist_user_message=persist_user_message,
+                 persist_user_timestamp=persist_user_timestamp,
++                is_voice_input=(event.message_type == MessageType.VOICE),
+             )
++            # Let downstream voice-reply delivery (both the _send_voice_reply
++            # call below and the platform adapter's own auto-TTS block) know
++            # this turn was already spoken live via streaming sentence-by-
++            # sentence as the agent generated it — skip re-speaking the full
++            # text. Always set (defaults False) so both checks are simple
++            # attribute reads regardless of which code path ran.
++            event._voice_already_spoken_live = bool(agent_result.get("voice_streamed_live"))
+ 
+             # Stop persistent typing indicator now that the agent is done.
+             # Slack AI status is scoped to a thread/workspace, so preserve the
+@@ -12569,10 +12790,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     session_entry.session_id,
+                 )
+                 response = ""
++            if response:
++                if getattr(event, "_voice_already_spoken_live", False):
++                    # The live streaming trailing-flush path already resolved
++                    # this turn's marker (and ran its side effect — speaking
++                    # the switch/sample confirmation) against
++                    # `_voice_stream_trailing`. `response` here is the
++                    # unmodified `final_response` from the agent result, so
++                    # it still contains the raw tag — re-running the full
++                    # method would match it again and speak the confirmation
++                    # a second time (confirmed: "Hey, this is Palak" said
++                    # twice). Just strip the tag textually this time.
++                    response = _VOICE_SWITCH_TAG_RE.sub("", response).strip()
++                else:
++                    response = await self._apply_voice_switch_marker(event.source, response)
+ 
+-            # Auto voice reply: send TTS audio before the text response
++            # Record the bot's reply for the voice-session recap (Feature 2),
++            # so the recap can report what was actually answered, not just what
++            # was asked. Voice turns only; no-op unless a recap session is open.
++            if response and getattr(event, "message_type", None) == MessageType.VOICE:
++                try:
++                    _recap_guild = self._get_guild_id(event)
++                    if _recap_guild is not None:
++                        self._record_voice_turn(int(_recap_guild), _RECAP_BOT_SPEAKER, response)
++                        # Track the latest spoken reply per guild so barge-in
++                        # can stash it if this reply gets interrupted.
++                        if not isinstance(getattr(self, "_last_voice_reply", None), dict):
++                            self._last_voice_reply = {}
++                        self._last_voice_reply[int(_recap_guild)] = response
++                except Exception:
++                    pass
++
++            # Auto voice reply: send TTS audio before the text response.
++            # Skip entirely if the streaming live-speech session already
++            # spoke this turn sentence-by-sentence as it was generated
++            # (see _run_agent_inner) — re-speaking the full text here would
++            # duplicate it.
+             _already_sent = bool(agent_result.get("already_sent"))
+-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
++            if (not getattr(event, "_voice_already_spoken_live", False)
++                    and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)):
+                 await self._send_voice_reply(event, response)
+ 
+             # If streaming already delivered the response, extract and
+@@ -13330,6 +13586,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             adapter._voice_input_callback = self._handle_voice_channel_input
+         if hasattr(adapter, "_on_voice_disconnect"):
+             adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
++        # Session-recap end hook (fired from leave_voice_channel).
++        adapter._voice_session_end_callback = self._handle_voice_session_end
++        # Barge-in hook (fired when a user interrupts the bot mid-reply).
++        adapter._barge_in_callback = self._handle_voice_barge_in
++        # Start a fresh, empty attributed log for this voice session. Empty at
++        # join = privacy: nothing said before the bot joined is ever captured.
++        if not isinstance(getattr(self, "_voice_session_log", None), dict):
++            self._voice_session_log = {}
++        self._voice_session_log[guild_id] = []
+         # Let the adapter's inactivity timer see the live voice-reply mode so it
+         # doesn't disconnect a deliberately text-only (/voice off) session.
+         if hasattr(adapter, "_voice_mode_getter"):
+@@ -13358,8 +13623,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             self._save_voice_modes()
+             self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
+             return (
+-                f"Joined voice channel **{voice_channel.name}**.\n"
+-                f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
++                f"Hey, I'm in **{voice_channel.name}** now — go ahead and talk to me!\n"
++                f"(`/voice leave` when you want me to head out.)"
+             )
+         # Join failed — clear callback
+         adapter._voice_input_callback = None
+@@ -13439,6 +13704,199 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         recent_store[key] = recent[-5:]
+         return False
+ 
++    def _voice_recap_config(self) -> dict:
++        """Read the ``voice.recap`` config block (all optional).
++
++        Keys: enabled (default False — opt-in, default-safe), channel_id
++        (default: the voice-linked text channel), min_turns (default 4),
++        max_turns (cap on how many turns feed the summary prompt).
++        """
++        try:
++            cfg = _load_gateway_config() or {}
++            voice_cfg = cfg.get("voice") or {}
++            recap = voice_cfg.get("recap") or {}
++            return recap if isinstance(recap, dict) else {}
++        except Exception:
++            return {}
++
++    def _record_voice_turn(self, guild_id: int, speaker: str, text: str) -> None:
++        """Append one attributed turn to this guild's voice-session log, if a
++        session is active. No-op when recap is disabled or no session is open.
++        Bounded to max_turns so a very long session can't grow unbounded."""
++        text = (text or "").strip()
++        if not text:
++            return
++        log_store = getattr(self, "_voice_session_log", None)
++        if not isinstance(log_store, dict) or guild_id not in log_store:
++            return
++        recap_cfg = self._voice_recap_config()
++        if not recap_cfg.get("enabled"):
++            return
++        try:
++            max_turns = int(recap_cfg.get("max_turns", 500))
++        except (TypeError, ValueError):
++            max_turns = 500
++        entries = log_store[guild_id]
++        entries.append({"speaker": str(speaker), "text": text})
++        if len(entries) > max_turns:
++            # Keep the most recent max_turns (recap favors the latest arc of a
++            # long session; also bounds the summary prompt token cost).
++            del entries[: len(entries) - max_turns]
++
++    async def _handle_voice_session_end(self, guild_id: int, text_channel_id: Optional[int] = None):
++        """Session-end hook (fired from adapter.leave_voice_channel). Generates
++        and posts a structured recap of the just-ended voice session, then
++        clears the log. Safe to call always: no-ops unless recap is enabled and
++        there was enough attributed conversation."""
++        log_store = getattr(self, "_voice_session_log", None)
++        entries = []
++        if isinstance(log_store, dict):
++            entries = log_store.pop(guild_id, []) or []
++        recap_cfg = self._voice_recap_config()
++        if not recap_cfg.get("enabled"):
++            return
++        try:
++            min_turns = int(recap_cfg.get("min_turns", 4))
++        except (TypeError, ValueError):
++            min_turns = 4
++        # No-questions / too-short session: skip silently rather than posting a
++        # near-empty recap.
++        user_turns = [e for e in entries if e.get("speaker") != _RECAP_BOT_SPEAKER]
++        if len(user_turns) < min_turns:
++            logger.info(
++                "Voice recap skipped for guild %s: only %d user turn(s) (min %d)",
++                guild_id, len(user_turns), min_turns,
++            )
++            return
++        # Resolve target channel: explicit config wins, else the voice-linked
++        # text channel captured at teardown.
++        target_channel_id = recap_cfg.get("channel_id") or text_channel_id
++        if not target_channel_id:
++            logger.info("Voice recap skipped for guild %s: no target channel", guild_id)
++            return
++        try:
++            recap_text = await self._generate_voice_recap(entries)
++        except Exception as exc:
++            logger.warning("Voice recap generation failed for guild %s: %s", guild_id, exc)
++            return
++        if not recap_text:
++            return
++        adapter = self.adapters.get(Platform.DISCORD)
++        if adapter is None:
++            return
++        try:
++            channel = adapter._client.get_channel(int(target_channel_id))
++            if channel is None:
++                channel = await adapter._client.fetch_channel(int(target_channel_id))
++            if channel is not None:
++                await channel.send(recap_text)
++                logger.info("Voice recap posted for guild %s to channel %s", guild_id, target_channel_id)
++        except Exception as exc:
++            logger.warning("Voice recap post failed for guild %s: %s", guild_id, exc)
++
++    async def _generate_voice_recap(self, entries: List[dict]) -> Optional[str]:
++        """Summarize an attributed voice-session transcript into a concise,
++        skimmable community recap via a direct LLM completion. Returns the
++        formatted message to post, or None. Never returns the raw transcript."""
++        if not entries:
++            return None
++        # Build the attributed transcript (this is fed to the summarizer only —
++        # it is NEVER posted).
++        transcript_lines = [f"{e['speaker']}: {e['text']}" for e in entries]
++        transcript = "\n".join(transcript_lines)
++
++        system_prompt = (
++            "You summarize a community voice session (an AMA / office-hours "
++            "style call) into a concise, skimmable recap for a text channel. "
++            "You are given an attributed transcript (each line is 'Speaker: "
++            "text'). Produce a short recap with these sections, omitting any "
++            "that are empty:\n"
++            "- **Questions asked** — bullet each real question and who asked "
++            "it (use their name).\n"
++            "- **Answered** — briefly, what was addressed.\n"
++            "- **Open / follow-up** — anything left unresolved or promised.\n"
++            "- **Action items** — concrete to-dos, if any.\n"
++            "Keep it tight and scannable — this is for the community, not a "
++            "transcript. Do NOT reproduce the transcript verbatim. Do not "
++            "invent anything not in the transcript. Use Discord markdown."
++        )
++        user_prompt = (
++            "Attributed transcript of the voice session:\n\n"
++            f"{transcript}\n\n"
++            "Write the recap now."
++        )
++
++        summary = await asyncio.to_thread(
++            self._voice_recap_completion, system_prompt, user_prompt
++        )
++        if not summary or not summary.strip():
++            return None
++        # Prepend a clear AI-summary + privacy note.
++        header = (
++            "📋 **Voice session recap**\n"
++            "_AI-generated summary of the live session — it only covers what "
++            "was said while the bot was in the channel._\n\n"
++        )
++        return (header + summary.strip())[:1990]
++
++    def _voice_recap_completion(self, system_prompt: str, user_prompt: str) -> Optional[str]:
++        """Blocking single LLM completion for the recap, using the gateway's
++        configured model/provider. Isolated + direct (no agent loop / no
++        persona) so the summary is neutral and self-contained."""
++        try:
++            from hermes_cli.config import load_config
++            cfg = load_config() or {}
++            model_cfg = cfg.get("model") or {}
++            if isinstance(model_cfg, str):
++                model = model_cfg
++                base_url = "https://api.openai.com/v1"
++                key_env = "OPENAI_API_KEY"
++            else:
++                model = model_cfg.get("default") or "gpt-5-chat-latest"
++                base_url = model_cfg.get("base_url") or "https://api.openai.com/v1"
++                key_env = model_cfg.get("api_key_env") or "OPENAI_API_KEY"
++            import os as _os
++            api_key = _os.environ.get(key_env, "")
++            if not api_key:
++                logger.warning("Voice recap: no API key in %s", key_env)
++                return None
++            from openai import OpenAI
++            client = OpenAI(api_key=api_key, base_url=base_url, timeout=45, max_retries=1)
++            try:
++                resp = client.chat.completions.create(
++                    model=model,
++                    messages=[
++                        {"role": "system", "content": system_prompt},
++                        {"role": "user", "content": user_prompt},
++                    ],
++                    max_completion_tokens=700,
++                )
++                return resp.choices[0].message.content
++            finally:
++                close = getattr(client, "close", None)
++                if callable(close):
++                    close()
++        except Exception as exc:
++            logger.warning("Voice recap completion failed: %s", exc)
++            return None
++
++    async def _handle_voice_barge_in(self, guild_id: int, user_id: int) -> None:
++        """Gateway side of a barge-in: stash the interrupted reply so the NEXT
++        turn (the interrupter's utterance) can decide to repeat, continue, or
++        drop it. Losing this context on interruption would be a bug — the model
++        needs to know it was cut off and what it was mid-way through saying.
++        The actual playback halt already happened in the adapter."""
++        interrupted = None
++        last = getattr(self, "_last_voice_reply", None)
++        if isinstance(last, dict):
++            interrupted = last.pop(guild_id, None)
++        if not interrupted:
++            return
++        if not isinstance(getattr(self, "_interrupted_voice_reply", None), dict):
++            self._interrupted_voice_reply = {}
++        self._interrupted_voice_reply[guild_id] = interrupted
++        logger.info("Barge-in: stashed interrupted reply for guild %s (%d chars)", guild_id, len(interrupted))
++
+     async def _handle_voice_channel_input(
+         self, guild_id: int, user_id: int, transcript: str
+     ):
+@@ -13455,21 +13913,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         if not text_ch_id:
+             return
+ 
++        # Resolve the speaker's real display name for attribution. Falls back
++        # to "someone" (never a numeric id, never a guessed wrong name) when
++        # the member can't be resolved — see resolve_member_name. This name
++        # flows into the shared-session "[name] message" labelling below, which
++        # is what lets the model follow who asked what across a multi-person
++        # conversation and address people by name.
++        _speaker_name = None
++        if hasattr(adapter, "resolve_member_name"):
++            _speaker_name = adapter.resolve_member_name(guild_id, user_id)
++        _speaker_name = _speaker_name or "someone"
++
++        # Record this speaker's turn for the end-of-session recap (Feature 2).
++        # Voice-only + post-join by construction (the log is created empty at
++        # join), so it never contains anything said before the bot joined.
++        self._record_voice_turn(guild_id, _speaker_name, transcript)
++
+         # Build source — reuse the linked text channel's metadata when available
+         # so voice input shares the same session as the bound text conversation.
+         source_data = getattr(adapter, "_voice_sources", {}).get(guild_id)
+         if source_data:
+             source = SessionSource.from_dict(source_data)
+             source.user_id = str(user_id)
+-            source.user_name = str(user_id)
++            source.user_name = _speaker_name
+         else:
+             source = SessionSource(
+                 platform=Platform.DISCORD,
+                 chat_id=str(text_ch_id),
+                 user_id=str(user_id),
+-                user_name=str(user_id),
++                user_name=_speaker_name,
+                 chat_type="channel",
+             )
++        # A voice channel is inherently a shared, multi-person conversation:
++        # force shared-multi-user session semantics so every speaker's turn is
++        # labelled with their name in the ONE shared history (rather than the
++        # per-user isolation a plain channel would get by default when
++        # group_sessions_per_user is True). Without this, two speakers could
++        # land in separate histories and the bot couldn't follow a
++        # cross-speaker conversation. See is_shared_multi_user_session /
++        # _prepare_message's "[name] message" labelling in this file.
++        source.force_shared_multi_user = True
+ 
+         # Check authorization before processing voice input
+         if not self._is_user_authorized(source):
+@@ -13505,6 +13988,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
+         )
+ 
++        # Barge-in continuity: if the bot's previous reply was interrupted,
++        # tell the model (via channel_context, which the LLM sees but which is
++        # NOT shown in the [Voice] channel post) so it can decide to continue,
++        # answer the new point, or move on — instead of losing that thread.
++        stashed = getattr(self, "_interrupted_voice_reply", None)
++        if isinstance(stashed, dict):
++            prev = stashed.pop(guild_id, None)
++            if prev:
++                event.channel_context = (
++                    "[Note: your previous spoken reply was interrupted by "
++                    f"{_speaker_name} before you finished. You were part-way "
++                    f'through saying: "{prev[:300]}". Read their new message '
++                    "and decide whether to briefly finish that thought, address "
++                    "their new point, or move on — don't just repeat it all.]"
++                )
++
+         await adapter.handle_message(event)
+ 
+     def _should_send_voice_reply(
+@@ -13577,6 +14076,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             if not tts_text:
+                 return
+ 
++            adapter = self._adapter_for_source(event.source)
++
++            # Try live-streaming playback first: pipes the TTS backend's
++            # audio straight into an active voice/stage connection as it's
++            # generated, instead of waiting for a whole file to finish
++            # synthesizing (see DiscordAdapter.speak_live). Falls through
++            # to the file-based path below when there's no live connection
++            # for this chat or the configured provider doesn't stream.
++            if adapter and hasattr(adapter, "speak_live"):
++                try:
++                    if await adapter.speak_live(event.source.chat_id, tts_text):
++                        return
++                except Exception as live_err:
++                    logger.warning(
++                        "speak_live failed, falling back to file-based voice reply: %s",
++                        live_err,
++                    )
++
+             # Telegram's adapter only sends native voice bubbles for OGG/Opus.
+             # Other platforms keep the existing MP3 default.
+             audio_ext = "ogg" if event.source.platform == Platform.TELEGRAM else "mp3"
+@@ -13586,14 +14103,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             )
+             os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+ 
+-            result_json = await asyncio.to_thread(
+-                text_to_speech_tool, text=tts_text, output_path=audio_path
++            # A per-guild voice (via /voice set, or the conversational
++            # switch marker) only ever reached the live voice-channel
++            # streaming path above — this file-based fallback always used
++            # the global tts.voice/MURF_DEFAULT_VOICE default regardless,
++            # since text_to_speech_tool has no concept of "which guild".
++            # Check for an override first and synthesize directly with it.
++            guild_voice = (
++                adapter.resolve_chat_guild_voice(event.source.chat_id)
++                if adapter and hasattr(adapter, "resolve_chat_guild_voice") else None
+             )
+-            try:
+-                result = json.loads(result_json)
+-            except (json.JSONDecodeError, TypeError):
+-                logger.warning("Auto voice reply TTS returned invalid JSON: %s", result_json[:200] if result_json else result_json)
+-                return
++            result: Optional[Dict[str, Any]] = None
++            if guild_voice:
++                try:
++                    from tools.tts_tool import _load_tts_config, _get_provider
++                    from agent.tts_registry import get_provider as _get_tts_plugin_provider
++                    from hermes_cli.plugins import _ensure_plugins_discovered
++
++                    tts_config = _load_tts_config()
++                    provider_name = _get_provider(tts_config)
++                    _ensure_plugins_discovered()
++                    provider = _get_tts_plugin_provider(provider_name)
++                    if provider is None:
++                        _ensure_plugins_discovered(force=True)
++                        provider = _get_tts_plugin_provider(provider_name)
++                    if provider is not None:
++                        written_path = await asyncio.to_thread(
++                            provider.synthesize, tts_text, audio_path, voice=guild_voice,
++                        )
++                        result = {"success": True, "file_path": written_path or audio_path}
++                except Exception as guild_voice_err:
++                    logger.warning(
++                        "Guild-voice synthesis failed, falling back to default voice: %s",
++                        guild_voice_err,
++                    )
++                    result = None
++
++            if result is None:
++                result_json = await asyncio.to_thread(
++                    text_to_speech_tool, text=tts_text, output_path=audio_path
++                )
++                try:
++                    result = json.loads(result_json)
++                except (json.JSONDecodeError, TypeError):
++                    logger.warning("Auto voice reply TTS returned invalid JSON: %s", result_json[:200] if result_json else result_json)
++                    return
+ 
+             # Use the actual file path from result (may differ after opus conversion)
+             actual_path = result.get("file_path", audio_path)
+@@ -13601,8 +14155,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
+                 return
+ 
+-            adapter = self._adapter_for_source(event.source)
+-
+             # If connected to a voice channel, play there instead of sending a file
+             guild_id = self._get_guild_id(event)
+             if (guild_id
+@@ -17522,6 +18074,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         moa_config: Optional[dict] = None,
+         persist_user_message: Optional[Any] = None,
+         persist_user_timestamp: Optional[float] = None,
++        is_voice_input: bool = False,
+     ) -> Dict[str, Any]:
+         """Profile-scoping wrapper around the agent run.
+ 
+@@ -17540,6 +18093,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 channel_prompt=channel_prompt, moa_config=moa_config,
+                 persist_user_message=persist_user_message,
+                 persist_user_timestamp=persist_user_timestamp,
++                is_voice_input=is_voice_input,
+             )
+ 
+         profile_home = self._resolve_profile_home_for_source(source)
+@@ -17551,6 +18105,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 channel_prompt=channel_prompt, moa_config=moa_config,
+                 persist_user_message=persist_user_message,
+                 persist_user_timestamp=persist_user_timestamp,
++                is_voice_input=is_voice_input,
+             )
+ 
+     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
+@@ -17672,10 +18227,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         moa_config: Optional[dict] = None,
+         persist_user_message: Optional[Any] = None,
+         persist_user_timestamp: Optional[float] = None,
++        is_voice_input: bool = False,
+     ) -> Dict[str, Any]:
+         """
+         Run the agent with the given message and context.
+-        
++
+         Returns the full result dict from run_conversation, including:
+           - "final_response": str (the text to send back)
+           - "messages": list (full conversation including tool calls)
+@@ -17869,6 +18425,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                         break
+         _voice_ack_loop = asyncio.get_running_loop()
+ 
++        # ── Discord live speech streaming (sentence-by-sentence TTS) ────
++        # When this turn is expected to get a spoken voice reply at all
++        # (mirrors _should_send_voice_reply's gating below), open a session
++        # that speaks each sentence as soon as it's generated instead of
++        # waiting for the whole reply to finish (see
++        # DiscordAdapter.start_live_speech / LiveSpeechSession). None when
++        # there's no live voice connection for this chat or the configured
++        # TTS provider doesn't stream — in that case _voice_stream_feed
++        # below never has a session to feed and this whole block is a
++        # no-op, falling back untouched to the existing full-text
++        # _send_voice_reply / base-adapter auto-TTS path.
++        _voice_stream_session = None
++        if source.platform == Platform.DISCORD:
++            _voice_mode_for_chat = self._voice_mode.get(
++                self._voice_key(source.platform, source.chat_id), "off"
++            )
++            _wants_voice_reply = (
++                _voice_mode_for_chat == "all"
++                or (_voice_mode_for_chat == "voice_only" and is_voice_input)
++            )
++            if _wants_voice_reply:
++                _va_stream = self.adapters.get(Platform.DISCORD)
++                if _va_stream is not None and hasattr(_va_stream, "start_live_speech"):
++                    try:
++                        _voice_stream_session = _va_stream.start_live_speech(source.chat_id)
++                    except Exception as _live_speech_err:
++                        logger.debug(
++                            "start_live_speech failed, falling back to full-text voice reply: %s",
++                            _live_speech_err,
++                        )
++
++        _voice_stream_buf = [""]
++        _voice_stream_sentence_re = re.compile(r"(?<=[.!?])\s+")
++
++        def _voice_stream_feed(delta: str) -> None:
++            """Split streamed token deltas into sentences and feed each
++            complete one to the live-speech session as soon as it's ready."""
++            if _voice_stream_session is None or not delta:
++                return
++            _voice_stream_buf[0] += delta
++            parts = _voice_stream_sentence_re.split(_voice_stream_buf[0])
++            if len(parts) <= 1:
++                return
++            complete, _voice_stream_buf[0] = parts[:-1], parts[-1]
++            for sentence in complete:
++                if sentence.strip():
++                    _voice_stream_session.feed_sentence(sentence)
++
+         def voice_ack_callback(call_id, tool_name, args):
+             """tool_start_callback: speak a one-time ack in the voice channel."""
+             if _voice_ack_fired[0] or _voice_ack_guild[0] is None:
+@@ -18708,6 +19312,103 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             # Set up stream consumer for token streaming or interim commentary.
+             _stream_consumer = None
+             _stream_delta_cb = None
++
++            # A single [[SWITCH_VOICE:]]/[[SAMPLE_VOICE:]] marker can be
++            # observed by more than one of this turn's delivery paths (the
++            # delta filter below, _interim_assistant_cb's own commentary
++            # snapshots, and the live-speech trailing flush all look at
++            # overlapping views of the same growing response text).
++            # Without a shared guard each one schedules its own fire-and-
++            # forget _apply_voice_switch_marker call — confirmed in
++            # practice as the same "Here's how X sounds" preview playing
++            # two or three times for one request. Keyed on the exact
++            # matched tag text so a genuinely different marker later in
++            # the same turn (unusual, but not forbidden) still fires.
++            _voice_marker_seen_tags: set = set()
++            # The tag is typically the very last thing in a reply, right
++            # after the short sentence announcing the switch/preview — so
++            # the delta filter below detects it almost the instant that
++            # sentence is handed to _voice_stream_feed, well before the
++            # live-speech session has actually started playing that
++            # sentence's audio (synthesis/connection setup takes real
++            # time). Firing the confirmation immediately raced against
++            # that: speak_live()'s "wait for current playback" check saw
++            # nothing playing *yet* and went first, so the confirmation
++            # ("Hey, this is X") was heard *before* "Switching to X now" —
++            # confirmed happening in practice. Deferring the actual
++            # side-effect to after the whole turn's text has been queued
++            # (see the flush below) fixes the ordering; queue it here.
++            _pending_voice_markers: list = []
++
++            def _schedule_voice_marker_once(tag_text: str) -> None:
++                match = _VOICE_SWITCH_TAG_RE.search(tag_text)
++                key = match.group(0).strip().upper() if match else tag_text.strip().upper()
++                if not key or key in _voice_marker_seen_tags:
++                    return
++                _voice_marker_seen_tags.add(key)
++                try:
++                    safe_schedule_threadsafe(
++                        self._apply_voice_switch_marker(source, tag_text),
++                        _voice_ack_loop,
++                        logger=logger,
++                        log_message="voice switch marker handling error",
++                    )
++                except Exception as _vsm_exc:
++                    logger.debug("Voice switch marker handling failed: %s", _vsm_exc)
++
++            def _marker_filter_output(chunk: str) -> None:
++                if _stream_consumer is not None:
++                    _stream_consumer.on_delta(chunk)
++                _voice_stream_feed(chunk)
++
++            _language_switched_locales: set = set()
++
++            def _handle_language_marker(tag_text: str) -> bool:
++                """If *tag_text* is a [[SPEAK_LANGUAGE: x]] marker, switch the
++                live-speech session's locale in real time (mid-stream, no
++                reconnect) and return True. Returns False for voice
++                switch/sample markers so the caller falls back to the
++                deferred post-turn handling those use.
++
++                Handled live rather than deferred because a language switch
++                must take effect BEFORE the reply's sentences are fed to the
++                TTS session — SOUL.md instructs the model to place the tag at
++                the very start of the reply, so the delta filter sees it
++                before the first sentence. Deduped per-turn per locale so the
++                same switch isn't issued twice if more than one delivery path
++                observes the tag.
++                """
++                m = _VOICE_SWITCH_TAG_RE.search(tag_text or "")
++                if not m or m.group(1).upper() != "SPEAK_LANGUAGE":
++                    return False
++                locale = _resolve_language_locale(m.group(2))
++                if locale and locale not in _language_switched_locales:
++                    _language_switched_locales.add(locale)
++                    if _voice_stream_session is not None and hasattr(
++                        _voice_stream_session, "switch_locale"
++                    ):
++                        try:
++                            _voice_stream_session.switch_locale(
++                                locale, voice=_LANGUAGE_SWITCH_VOICE,
++                            )
++                        except Exception as _lang_exc:
++                            logger.debug("live language switch failed: %s", _lang_exc)
++                return True
++
++            def _marker_filter_hit(tag_text: str) -> None:
++                # Language markers switch the live session immediately;
++                # voice switch/sample markers defer to post-turn handling.
++                if _handle_language_marker(tag_text):
++                    return
++                _pending_voice_markers.append(tag_text)
++
++            # Buffers raw streamed deltas so a `[[SWITCH_VOICE:]]`/
++            # `[[SAMPLE_VOICE:]]` marker never reaches the visible Discord
++            # message text or the live-speech TTS feed even partially while
++            # it's still arriving token-by-token — see _MarkerDeltaFilter.
++            # Both _stream_delta_cb variants below feed this same instance
++            # instead of calling on_delta/_voice_stream_feed directly.
++            _marker_delta_filter = _MarkerDeltaFilter(_marker_filter_output, _marker_filter_hit)
+             _scfg = getattr(getattr(self, 'config', None), 'streaming', None)
+             if _scfg is None:
+                 from gateway.config import StreamingConfig
+@@ -18791,15 +19492,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                         if _want_stream_deltas:
+                             def _stream_delta_cb(text: str) -> None:
+                                 if _run_still_current():
+-                                    _stream_consumer.on_delta(text)
++                                    _marker_delta_filter.feed(text)
+                         stream_consumer_holder[0] = _stream_consumer
+                 except Exception as _sc_err:
+                     logger.debug("Could not set up stream consumer: %s", _sc_err)
+ 
++            # Live voice speech-streaming needs raw token deltas even when
++            # text-streaming (GatewayStreamConsumer, above) is off for this
++            # platform/config — e.g. Discord voice replies with
++            # display.platforms.discord.streaming left at its default. Give
++            # it its own minimal delta callback in that case; it never
++            # touches _stream_consumer, so text-delivery behavior for
++            # platforms/chats without an active voice session is unchanged.
++            if _stream_delta_cb is None and _voice_stream_session is not None:
++                def _stream_delta_cb(text: str) -> None:
++                    if _run_still_current():
++                        _marker_delta_filter.feed(text)
++
+             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                 if not _run_still_current():
+                     return
+                 display_text = text
++                if display_text and _VOICE_SWITCH_TAG_RE.search(display_text):
++                    # Interim/commentary messages are a THIRD delivery path
++                    # (alongside the live-speech sentence feed and the
++                    # final response text) that bypasses the post-hoc
++                    # _apply_voice_switch_marker call entirely — confirmed
++                    # leaking the raw "[[SWITCH_VOICE: x]]" tag verbatim
++                    # into a real reply. Strip it synchronously (just a
++                    # regex substitution, no need to wait on anything) so
++                    # it never reaches display. Queue the actual side effect
++                    # rather than firing it immediately — same ordering
++                    # reasoning as _marker_filter_hit above, and the shared
++                    # dedup means it's harmless if the delta filter already
++                    # queued this exact tag too.
++                    display_text = _VOICE_SWITCH_TAG_RE.sub("", display_text).strip()
++                    # SPEAK_LANGUAGE routes to the live locale switch (deduped);
++                    # voice switch/sample defer to post-turn handling.
++                    if not _handle_language_marker(text):
++                        _pending_voice_markers.append(text)
+                 if _stream_consumer is not None:
+                     if already_streamed:
+                         _stream_consumer.on_segment_break()
+@@ -19654,6 +20385,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 if _persist_user_timestamp_override is not None:
+                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
++            except Exception:
++                # An exception here means execution never reaches the
++                # normal _voice_stream_session.finish() call below — abort
++                # explicitly so its worker thread (blocked on an empty
++                # queue otherwise) doesn't leak for the rest of the
++                # process's life.
++                if _voice_stream_session is not None:
++                    try:
++                        _voice_stream_session.abort()
++                    except Exception:
++                        pass
++                raise
+             finally:
+                 unregister_gateway_notify(_approval_session_key)
+                 # Cancel any pending clarify entries so blocked agent
+@@ -19667,10 +20410,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 reset_current_session_key(_approval_session_token)
+             result_holder[0] = result
+ 
++            # Flush whatever the marker filter is still holding back (e.g.
++            # an unclosed "[[" at the very end of the reply) so it reaches
++            # its normal destinations before the stream consumer/live-speech
++            # session are finalized below.
++            _marker_delta_filter.flush()
++
+             # Signal the stream consumer that the agent is done
+             if _stream_consumer is not None:
+                 _stream_consumer.finish()
+-            
++
++            # Flush any trailing text that never hit terminal punctuation
++            # (so it was never handed to _voice_stream_feed's sentence
++            # splitter) and close out the live-speech session. Non-
++            # blocking — see LiveSpeechSession.finish().
++            _voice_streamed_live = False
++            if _voice_stream_session is not None:
++                _voice_stream_trailing = _voice_stream_buf[0].strip()
++                if _voice_stream_trailing:
++                    # Strip/apply a [[SWITCH_VOICE:]]/[[SAMPLE_VOICE:]]
++                    # marker here, before it's fed to the TTS session —
++                    # otherwise the raw bracketed tag would get spoken
++                    # literally. Only covers the marker landing in this
++                    # trailing flush (the model is instructed to place it
++                    # at the very end of its reply); one already
++                    # mid-stream by the time it's detected can't be
++                    # un-spoken, a disclosed limitation of doing this
++                    # sentence-at-a-time rather than on a complete
++                    # response.
++                    # Strip the tag with a plain synchronous regex — instant,
++                    # can't fail or time out — instead of blocking on
++                    # _apply_voice_switch_marker's full resolution (which
++                    # awaits speak_live, itself waiting for any in-progress
++                    # playback to finish naturally). That combination
++                    # previously blocked this turn's finalization for
++                    # several seconds AND, if it ever exceeded the old
++                    # 10s timeout, left the raw "[[SWITCH_VOICE: x]]" tag
++                    # in place to be spoken/shown literally (confirmed
++                    # happening after an `_ssl.c:999: handshake operation
++                    # timed out` failure in speak_live's synthesis stream).
++                    # The actual switch/sample side effect still runs, just
++                    # as a fire-and-forget background task on the loop
++                    # captured earlier (_voice_ack_loop) — matching how
++                    # _interim_assistant_cb already handles this same tag
++                    # for its own delivery path.
++                    if _VOICE_SWITCH_TAG_RE.search(_voice_stream_trailing):
++                        # SPEAK_LANGUAGE handled live (deduped); voice
++                        # switch/sample deferred as before.
++                        if not _handle_language_marker(_voice_stream_trailing):
++                            _pending_voice_markers.append(_voice_stream_trailing)
++                        _voice_stream_trailing = _VOICE_SWITCH_TAG_RE.sub(
++                            "", _voice_stream_trailing,
++                        ).strip()
++                if _voice_stream_trailing:
++                    _voice_stream_session.feed_sentence(_voice_stream_trailing)
++                _voice_streamed_live = _voice_stream_session.finish()
++
++            # Now that every sentence of this turn's reply — including the
++            # one right before the tag ("Switching to X now.") — has been
++            # fed to the live-speech session (and, per finish()'s grace
++            # period, had a real chance to actually start playing), it's
++            # safe to fire the switch/sample side effect. Doing this any
++            # earlier (e.g. the instant the tag is first detected mid-
++            # stream) raced against the main reply's own audio actually
++            # starting, since speak_live()'s "wait for current playback"
++            # check only waits if it *already* sees something playing —
++            # confirmed in practice as the confirmation ("Hey, this is X")
++            # being heard before "Switching to X now" itself.
++            for _pending_tag in _pending_voice_markers:
++                _schedule_voice_marker_once(_pending_tag)
++
+             # Return final response, or a message if something went wrong
+             final_response = result.get("final_response")
+ 
+@@ -19814,8 +20623,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     "output_tokens": _output_toks,
+                     "model": _resolved_model,
+                     "context_length": _context_length,
++                    "voice_streamed_live": _voice_streamed_live,
+                 }
+-            
++
+             # Scan tool results for MEDIA:<path> tags that need to be delivered
+             # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
+             # in its JSON response, but the model's final text reply usually
+@@ -19938,6 +20748,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 # self-persisted (it didn't — see codex_runtime.py).  Default
+                 # True preserves the skip-db behaviour for the standard runtime.
+                 "agent_persisted": (result_holder[0].get("agent_persisted", True) if result_holder[0] else True),
++                "voice_streamed_live": _voice_streamed_live,
+             }
+         
+         # Start progress message sender if enabled. Gate on needs_progress_queue
+diff --git a/gateway/session.py b/gateway/session.py
+index b964add..7c00067 100644
+--- a/gateway/session.py
++++ b/gateway/session.py
+@@ -176,6 +176,12 @@ class SessionSource:
+     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
+     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+     role_authorized: bool = False  # True when adapter granted access via role (not user ID)
++    # In-process only (not wire-serialized, like role_authorized): force a
++    # single shared multi-user session regardless of the per-user isolation
++    # config. Set for Discord voice channels, which are inherently one shared
++    # multi-person conversation. Honored by build_session_key and
++    # is_shared_multi_user_session.
++    force_shared_multi_user: bool = False
+     # Profile this inbound message is routed to in a multiplexing gateway
+     # (from the /p/<profile>/ URL prefix or per-credential adapter ownership).
+     # None => the gateway's active/default profile. Drives both session-key
+@@ -865,6 +871,11 @@ def is_shared_multi_user_session(
+     """
+     if source.chat_type == "dm":
+         return False
++    # A source may force shared multi-user semantics (e.g. Discord voice
++    # channels) — see build_session_key's matching check and
++    # SessionSource.force_shared_multi_user.
++    if getattr(source, "force_shared_multi_user", False):
++        return True
+     if source.thread_id:
+         return not thread_sessions_per_user
+     return not group_sessions_per_user
+@@ -975,6 +986,14 @@ def build_session_key(
+     if source.thread_id and not thread_sessions_per_user:
+         isolate_user = False
+ 
++    # A source may force a single shared session regardless of the per-user
++    # isolation config — used for Discord voice channels, which are inherently
++    # one shared, multi-person conversation (every speaker must land in the
++    # same history so the bot can follow a cross-speaker exchange). Set via
++    # SessionSource.force_shared_multi_user.
++    if getattr(source, "force_shared_multi_user", False):
++        isolate_user = False
++
+     if isolate_user and participant_id:
+         key_parts.append(str(participant_id))
+ 
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+index 9223689..73dd975 100644
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -2526,16 +2526,199 @@ class GatewaySlashCommandsMixin:
+ 
+         return t("gateway.set_home.success", name=chat_name, chat_id=chat_id)
+ 
++    @staticmethod
++    def _resolve_murf_provider_and_voices():
++        """Return (provider, voices) for the configured TTS plugin
++        provider, or (None, []) if unavailable. ``voices`` is the raw
++        list of dicts from :meth:`TTSProvider.list_voices`.
++        """
++        try:
++            from tools.tts_tool import _load_tts_config, _get_provider
++            from agent.tts_registry import get_provider as _get_tts_plugin_provider
++            from hermes_cli.plugins import _ensure_plugins_discovered
++
++            tts_config = _load_tts_config()
++            provider_name = _get_provider(tts_config)
++            _ensure_plugins_discovered()
++            provider = _get_tts_plugin_provider(provider_name)
++            if provider is None:
++                _ensure_plugins_discovered(force=True)
++                provider = _get_tts_plugin_provider(provider_name)
++            if provider is None or not hasattr(provider, "list_voices"):
++                return None, []
++            return provider, (provider.list_voices() or [])
++        except Exception:
++            return None, []
++
++    @staticmethod
++    def _match_voice_query(query: str, voices: list) -> tuple:
++        """Resolve a user-typed voice query against the voice catalog.
++
++        Returns ``(match, candidates)``: ``match`` is the single resolved
++        voice dict or None; ``candidates`` holds up to 8 close matches to
++        suggest when the query was ambiguous or not found.
++        """
++        q = query.strip().lower()
++        if not q:
++            return None, []
++        for v in voices:
++            if str(v.get("id", "")).lower() == q:
++                return v, []
++        exact_display = [v for v in voices if str(v.get("display", "")).lower() == q]
++        if len(exact_display) == 1:
++            return exact_display[0], []
++        candidates = [
++            v for v in voices
++            if q in str(v.get("id", "")).lower() or q in str(v.get("display", "")).lower()
++        ]
++        if len(candidates) == 1:
++            return candidates[0], []
++        return None, candidates[:8]
++
++    @staticmethod
++    def _format_voice_line(v: dict) -> str:
++        lang = v.get("language") or "?"
++        gender = v.get("gender") or ""
++        gender_part = f", {gender}" if gender else ""
++        return f"`{v.get('id')}` — {v.get('display')} ({lang}{gender_part})"
++
++    async def _handle_voice_list_command(self, query: str) -> str:
++        provider, voices = self._resolve_murf_provider_and_voices()
++        if provider is None:
++            return "⚠️ No TTS plugin provider with a voice catalog is configured."
++        if not voices:
++            return "⚠️ Couldn't fetch the voice catalog right now — try again shortly."
++
++        q = query.strip().lower()
++        if q in {"male", "female", "m", "f"}:
++            # Exact gender filter, not substring — "male" is a substring of
++            # "female", so a naive `in` check would return both genders for
++            # either query. Confirmed real gap: the bot itself suggested
++            # "/voice list male" as something that would work, and it
++            # silently matched nothing at all before this fix.
++            target_gender = "male" if q in {"male", "m"} else "female"
++            matches = [v for v in voices if (v.get("gender") or "").lower() == target_gender]
++        elif q:
++            matches = [
++                v for v in voices
++                if q in str(v.get("id", "")).lower()
++                or q in str(v.get("display", "")).lower()
++                or q in str(v.get("language", "")).lower()
++            ]
++        else:
++            matches = voices
++
++        if not matches:
++            return f"No voices matched \"{query}\". Try `/voice list` with no query to browse, or a language code like `en-US`."
++
++        shown = matches[:15]
++        lines = [self._format_voice_line(v) for v in shown]
++        header = f"**{len(matches)} voice(s)**" + (f' matching "{query}"' if q else "") + f" — showing {len(shown)}:"
++        footer = "\nUse `/voice set <id or name>` to make it this server's voice, or `/voice sample <id or name>` to preview it."
++        return header + "\n" + "\n".join(lines) + footer
++
++    async def _handle_voice_set_command(self, event: MessageEvent, query: str) -> str:
++        if not query.strip():
++            return "Usage: `/voice set <voice id or name>` — try `/voice list` to browse first."
++        adapter = self.adapters.get(event.source.platform)
++        guild_id = self._get_guild_id(event)
++        if not guild_id or not hasattr(adapter, "set_guild_voice"):
++            return "⚠️ `/voice set` only works in a server, not a DM."
++
++        provider, voices = self._resolve_murf_provider_and_voices()
++        if provider is None:
++            return "⚠️ No TTS plugin provider with a voice catalog is configured."
++        match, candidates = self._match_voice_query(query, voices)
++        if match is None:
++            if candidates:
++                lines = [self._format_voice_line(v) for v in candidates]
++                return f"\"{query}\" matched more than one voice — be more specific:\n" + "\n".join(lines)
++            return f"No voice matched \"{query}\". Try `/voice list {query}` to search."
++
++        adapter.set_guild_voice(guild_id, match["id"])
++        return f"✅ This server's voice is now **{match.get('display')}** (`{match['id']}`)."
++
++    async def _handle_voice_sample_command(self, event: MessageEvent, rest: str) -> str:
++        if not rest.strip():
++            return "Usage: `/voice sample <voice id or name> [text to speak]`"
++        parts = rest.strip().split(None, 1)
++        query = parts[0]
++        sample_text = parts[1] if len(parts) > 1 else (
++            "Hi, this is a quick preview of my voice. What do you think?"
++        )
++
++        provider, voices = self._resolve_murf_provider_and_voices()
++        if provider is None:
++            return "⚠️ No TTS plugin provider with a voice catalog is configured."
++        match, candidates = self._match_voice_query(query, voices)
++        if match is None:
++            if candidates:
++                lines = [self._format_voice_line(v) for v in candidates]
++                return f"\"{query}\" matched more than one voice — be more specific:\n" + "\n".join(lines)
++            return f"No voice matched \"{query}\". Try `/voice list {query}` to search."
++
++        adapter = self.adapters.get(event.source.platform)
++        chat_id = event.source.chat_id
++        voice_id = match["id"]
++
++        # Prefer speaking live if connected — same low-latency streaming
++        # path as a normal reply, just with a one-off voice override that
++        # never touches the server's persisted choice.
++        if adapter is not None and hasattr(adapter, "speak_live"):
++            try:
++                spoke = await adapter.speak_live(chat_id, sample_text, voice_override=voice_id)
++                if spoke:
++                    return f"🔊 Sampling **{match.get('display')}** (`{voice_id}`) in the voice channel now."
++            except Exception:
++                pass
++
++        # Not in a live voice connection — synthesize a one-off clip and
++        # deliver it as an attachment instead.
++        if adapter is None or not hasattr(adapter, "send_voice"):
++            return "⚠️ This platform doesn't support delivering a voice sample here."
++        output_path = None
++        try:
++            import tempfile
++            import uuid as _uuid
++
++            output_path = os.path.join(
++                tempfile.gettempdir(), "hermes_voice_sample", f"sample_{_uuid.uuid4().hex[:12]}.mp3",
++            )
++            os.makedirs(os.path.dirname(output_path), exist_ok=True)
++            provider.synthesize(sample_text, output_path, voice=voice_id)
++            result = await adapter.send_voice(chat_id=chat_id, audio_path=output_path)
++            if not result.success:
++                return f"⚠️ Failed to deliver the sample: {result.error}"
++            return f"🔊 Sample of **{match.get('display')}** (`{voice_id}`) above."
++        except Exception as exc:
++            return f"⚠️ Couldn't generate that sample: {exc}"
++        finally:
++            if output_path:
++                try:
++                    os.unlink(output_path)
++                except OSError:
++                    pass
++
+     async def _handle_voice_command(self, event: MessageEvent) -> str:
+-        """Handle /voice [on|off|tts|channel|leave|status] command."""
+-        args = event.get_command_args().strip().lower()
++        """Handle /voice [on|off|tts|channel|leave|status|list|set|sample] command."""
++        raw_args = event.get_command_args().strip()
++        args = raw_args.lower()
+         chat_id = event.source.chat_id
+         platform = event.source.platform
+         voice_key = self._voice_key(platform, chat_id)
+ 
+         adapter = self.adapters.get(platform)
+ 
+-        if args in {"on", "enable"}:
++        if args in {"list", "voices"} or args.startswith("list ") or args.startswith("voices "):
++            query = raw_args.split(None, 1)[1] if " " in raw_args else ""
++            return await self._handle_voice_list_command(query)
++        elif args == "set" or args.startswith("set "):
++            query = raw_args[3:].strip() if args.startswith("set ") else ""
++            return await self._handle_voice_set_command(event, query)
++        elif args == "sample" or args.startswith("sample "):
++            rest = raw_args[6:].strip() if args.startswith("sample ") else ""
++            return await self._handle_voice_sample_command(event, rest)
++        elif args in {"on", "enable"}:
+             self._voice_mode[voice_key] = "voice_only"
+             self._save_voice_modes()
+             if adapter:
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index e4d8e49..91a22d7 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -15,6 +15,7 @@ import inspect
+ import json
+ import logging
+ import os
++import queue
+ import re
+ import struct
+ import subprocess
+@@ -126,6 +127,7 @@ from gateway.platforms.base import (
+     validate_inbound_media_size,
+ )
+ from tools.url_safety import is_safe_url
++from agent.async_utils import safe_schedule_threadsafe
+ 
+ 
+ def _truncate_discord_component_text(text: str, limit: int) -> str:
+@@ -353,6 +355,461 @@ def _discord_ready_timeout_seconds() -> float:
+     return 30.0
+ 
+ 
++def _mono16_to_stereo16(mono: bytes) -> bytes:
++    """Duplicate mono 16-bit PCM samples into interleaved stereo (L=R).
++
++    Murf's streaming WS sends mono; Discord voice (and the mixer) require
++    stereo. Used to feed live TTS chunks straight into voice playback
++    instead of waiting for a full file to be written and converted.
++    """
++    if not mono:
++        return b""
++    usable = len(mono) - (len(mono) % 2)
++    if usable <= 0:
++        return b""
++    import array
++    mono_samples = array.array("h")
++    mono_samples.frombytes(mono[:usable])
++    n = len(mono_samples)
++    stereo = array.array("h", bytes(4 * n))
++    stereo[0::2] = mono_samples
++    stereo[1::2] = mono_samples
++    return stereo.tobytes()
++
++
++if DISCORD_AVAILABLE:
++    class _LiveTTSAudioSource(discord.AudioSource):
++        """Feeds a live/streaming TTS backend directly into ``vc.play()``.
++
++        Used only when no continuous mixer is installed for the guild (see
++        :meth:`DiscordAdapter.speak_live`). Frames are pulled from an
++        internal buffer that a background producer thread appends to as
++        audio arrives from the TTS websocket, instead of ``vc.play()``
++        reading a file that was fully synthesized before playback began.
++        """
++
++        FRAME_SIZE = 3840  # discord.opus.Encoder.FRAME_SIZE: 20ms @ 48kHz stereo s16le
++
++        def __init__(self):
++            self._lock = threading.Lock()
++            self._buf = bytearray()
++            self._pos = 0
++            self._done = False
++
++        def append(self, stereo_pcm: bytes) -> None:
++            if not stereo_pcm:
++                return
++            with self._lock:
++                self._buf.extend(stereo_pcm)
++
++        def close(self) -> None:
++            with self._lock:
++                self._done = True
++
++        def flush(self) -> None:
++            """Drop all un-played audio immediately (barge-in). Murf streams
++            several seconds ahead of real time, so this local buffer holds the
++            audio the bot would otherwise keep speaking after an interrupt —
++            clearing it is what actually makes the bot go quiet fast. Marks the
++            source done so ``read`` returns end-of-stream and playback stops."""
++            with self._lock:
++                self._buf = bytearray()
++                self._pos = 0
++                self._done = True
++
++        def pending_bytes(self) -> int:
++            """Un-played audio still buffered — >0 means the bot is audibly
++            speaking right now (used to gate barge-in detection to the real
++            playback window, not the producer's lifecycle)."""
++            with self._lock:
++                return max(0, len(self._buf) - self._pos)
++
++        def read(self) -> bytes:
++            with self._lock:
++                available = len(self._buf) - self._pos
++                if available >= self.FRAME_SIZE:
++                    chunk = bytes(self._buf[self._pos:self._pos + self.FRAME_SIZE])
++                    self._pos += self.FRAME_SIZE
++                    return chunk
++                if self._done:
++                    if available <= 0:
++                        return b""
++                    chunk = bytes(self._buf[self._pos:]) + b"\x00" * (self.FRAME_SIZE - available)
++                    self._pos = len(self._buf)
++                    return chunk
++                # Producer hasn't caught up yet — hold with silence rather
++                # than ending the stream; more audio may still arrive.
++                return b"\x00" * self.FRAME_SIZE
++
++        def is_opus(self) -> bool:
++            return False
++else:
++    _LiveTTSAudioSource = None
++
++
++class LiveSpeechSession:
++    """Feeds sentence-sized chunks of text into a live voice connection as
++    they become available, instead of waiting for a complete reply.
++
++    Call :meth:`feed_sentence` as each complete sentence becomes available
++    (e.g. from streamed LLM token deltas, split on sentence boundaries by
++    the caller — see gateway/run.py's ``_voice_stream_feed``), then
++    :meth:`finish` once there's no more text coming. A single
++    background worker thread synthesizes queued sentences strictly in
++    order and appends each one's audio to a shared sink, so playback stays
++    gapless and correctly ordered even though sentence N+1 may be queued
++    (and start synthesizing) before sentence N has finished playing.
++
++    Both methods are thread-safe and meant to be called from whatever
++    thread produces the text — including a non-event-loop worker thread,
++    matching how ``stream_delta_callback`` itself fires from the agent's
++    own worker thread.
++    """
++
++    def __init__(self, *, adapter, guild_id: int, vc, mixer, sink, provider,
++                 voice, model, loop: Optional[asyncio.AbstractEventLoop],
++                 barge_in: bool = False):
++        self._adapter = adapter
++        self._guild_id = guild_id
++        self._vc = vc
++        self._mixer = mixer
++        self._sink = sink
++        self._provider = provider
++        self._voice = voice
++        self._model = model
++        self._loop = loop
++        self._barge_in = bool(barge_in)
++        self._queue: "queue.Queue[Optional[str]]" = queue.Queue()
++        self._spoke_anything = threading.Event()
++        self._aborted = threading.Event()
++        self._playback_started = False
++        self._live_session = None  # set once opened, for abort() to close
++        self._worker = threading.Thread(
++            target=self._run, daemon=True, name="murf-live-tts-session",
++        )
++        self._worker.start()
++
++    def feed_sentence(self, text: str) -> None:
++        text = (text or "").strip()
++        if text:
++            self._queue.put(text)
++
++    def has_pending_audio(self) -> bool:
++        """True while there's un-played audio buffered — i.e. the bot is
++        actually speaking right now. Used to gate barge-in detection to the
++        real playback window rather than the worker thread's lifecycle (the
++        worker finishes ~when Murf's front-loaded audio is received, seconds
++        before it's actually played out)."""
++        sink = self._sink
++        try:
++            if hasattr(sink, "pending_bytes"):
++                return sink.pending_bytes() > 0
++        except Exception:
++            pass
++        # Fallback (unknown sink): assume speaking until the session aborts.
++        return not self._aborted.is_set()
++
++    def switch_locale(self, locale: str, *, voice: Optional[str] = None) -> None:
++        """Switch the spoken language/voice for text fed AFTER this call,
++        mid-session, with no WebSocket reconnect (see
++        ``MurfLiveSession.switch``). Thread-safe.
++
++        Enqueued through the same FIFO the sentences use, so ordering is
++        preserved: everything fed before this keeps the old voice/locale,
++        everything after speaks in the new one. Meant to be called the
++        instant a ``[[SPEAK_LANGUAGE: ...]]`` marker is detected at the
++        start of a reply, before that reply's sentences are fed — see
++        gateway/run.py's marker handling. A no-op on the per-sentence
++        fallback path only in that it still updates the voice/locale used
++        for subsequent sentences.
++        """
++        if not locale:
++            return
++        self._queue.put(("__switch__", voice, locale))
++
++    def abort(self) -> None:
++        """Stop this session from producing any further audio, and unblock
++        the worker thread if it's waiting on an empty queue (safe to call
++        whether or not :meth:`feed_sentence`/:meth:`finish` were ever
++        called — e.g. from an exception handler before any text arrived).
++
++        Used when :meth:`finish` times out waiting for the first chunk and
++        the caller falls back to another delivery path — without this, a
++        slow-to-arrive chunk could still get appended and (for the
++        non-mixer path) played moments later, duplicating the reply the
++        fallback path already spoke.
++        """
++        self._aborted.set()
++        self._sink.close()
++        self._queue.put(None)
++        if self._live_session is not None:
++            # Unblocks a reader thread parked in a blocking recv on this
++            # connection, waiting for Murf's next audio message.
++            self._live_session.close()
++
++    def interrupt(self) -> None:
++        """Barge-in halt: stop the bot talking as fast as possible.
++
++        Order matters and each step is necessary (see the barge-in research):
++          1. ``clear`` the Murf context so the SERVER stops generating more
++             audio (~80ms server-side). Necessary but NOT sufficient on its
++             own — Murf streams ~4s ahead of real time.
++          2. ``flush`` the local sink buffer — this is the audio already
++             delivered that the bot would otherwise keep speaking for
++             seconds; dropping it is what actually produces fast silence.
++          3. ``abort`` the worker/reader threads and mark done.
++        Safe to call once; idempotent-ish (abort guards on the event).
++        """
++        # 1. tell Murf to stop generating (best-effort, non-blocking).
++        if self._live_session is not None and hasattr(self._live_session, "clear"):
++            try:
++                self._live_session.clear()
++            except Exception:
++                pass
++        # 2. drop everything already buffered locally — the critical step.
++        try:
++            if hasattr(self._sink, "flush"):
++                self._sink.flush()
++        except Exception:
++            pass
++        # 2b. Non-mixer path: stop Discord playback outright (~one 20ms frame).
++        # Mixer path: do NOT vc.stop() — that would kill the shared continuous
++        # mixer (ambient bed + everyone's audio); flushing the child above
++        # already drops the speech and the mixer keeps running silently.
++        if self._mixer is None and self._vc is not None:
++            try:
++                if self._vc.is_playing():
++                    self._vc.stop()
++            except Exception:
++                pass
++        # 3. tear down worker/reader + connection.
++        self.abort()
++
++    def finish(self, *, grace_period: float = 1.0) -> bool:
++        """Signal no more sentences are coming and report whether anything
++        was (or, within a short grace period, will imminently be) spoken.
++        Aborts the session (see :meth:`abort`) if the grace period elapses
++        with nothing spoken, so it can never produce audio after the
++        caller has moved on to a fallback delivery path.
++
++        A short bounded wait matters here: for a fast, short reply — the
++        common case, since SOUL.md asks for 2-3 sentence spoken replies —
++        the last (often only) sentence is typically still queued or just
++        barely dequeued at the moment the caller reaches this, since
++        producing real audio needs a network round-trip to the TTS
++        backend. Checking ``_spoke_anything`` immediately, with no wait,
++        would almost always read False for exactly those short replies —
++        this session WOULD end up speaking a moment later, but the caller
++        would already have decided to fall back to the old full-text path
++        too, duplicating the reply. This method must be safe to block
++        the calling thread briefly; do not call it from a shared event
++        loop that other requests depend on (the caller in
++        gateway/run.py's ``_run_agent_inner`` already runs its own
++        synchronous ``agent.run_conversation()`` call in this same spot,
++        so it is not on a loop shared with other in-flight turns)."""
++        self._queue.put(None)
++        spoke = self._spoke_anything.wait(timeout=grace_period)
++        if not spoke:
++            self.abort()
++        return spoke
++
++    def _run(self) -> None:
++        try:
++            live_session = None
++            if hasattr(self._provider, "open_live_session"):
++                try:
++                    live_session = self._provider.open_live_session(
++                        voice=self._voice, model=self._model,
++                        format="pcm", sample_rate=48000,
++                    )
++                except Exception as exc:
++                    logger.debug(
++                        "[%s] Live speech: no persistent Murf session "
++                        "(%s), reconnecting per sentence instead",
++                        self._adapter.name, exc,
++                    )
++            if live_session is not None:
++                self._live_session = live_session
++                self._run_persistent(live_session)
++            else:
++                self._run_per_sentence()
++        finally:
++            self._sink.close()
++            # NOTE: do NOT clear barge-in state here — the worker finishing
++            # only means Murf's (front-loaded) audio has been received, not
++            # that it's finished playing. The barge-in watcher clears state
++            # once the sink is actually drained (has_pending_audio False).
++
++    def _run_persistent(self, live_session: "MurfLiveSession") -> None:
++        """Sender/receiver pair sharing ONE Murf WebSocket connection for
++        the whole reply, instead of reconnecting per sentence.
++
++        A dedicated reader thread continuously drains audio (Murf
++        guarantees output order matches input order, so chunks can be
++        appended to the sink as they arrive with no per-sentence
++        bookkeeping needed); this thread sends each queued sentence to
++        Murf the instant it's dequeued, then a separate empty-text
++        ``end: true`` finalizer once the queue is signaled done —
++        verified live against Murf's API that this doesn't truncate or
++        error. (An earlier version held back the most-recently-dequeued
++        sentence to attach ``end: true`` to the real last one, which
++        meant sentence N's synthesis couldn't start until sentence N+1
++        had already been generated by the LLM — silently eating most of
++        the latency win this whole feature exists for.)
++        """
++        def _reader():
++            try:
++                for raw_chunk in live_session.iter_audio():
++                    if self._aborted.is_set():
++                        break
++                    if not raw_chunk:
++                        continue
++                    self._sink.append(_mono16_to_stereo16(raw_chunk))
++                    if not self._spoke_anything.is_set():
++                        self._spoke_anything.set()
++                        self._start_playback_if_needed()
++            except Exception as exc:
++                if not self._aborted.is_set():
++                    logger.warning(
++                        "[%s] Live speech: reading Murf audio failed: %s",
++                        self._adapter.name, exc,
++                    )
++
++        reader = threading.Thread(
++            target=_reader, daemon=True, name="murf-live-tts-reader",
++        )
++        reader.start()
++
++        try:
++            while not self._aborted.is_set():
++                item = self._queue.get()
++                if item is None:
++                    if not self._aborted.is_set():
++                        live_session.send_text("", end=True)
++                    break
++                if isinstance(item, tuple) and item and item[0] == "__switch__":
++                    # ("__switch__", voice, locale) — reconfigure the live
++                    # voice/locale for subsequent sentences without
++                    # reconnecting. Only the end-of-turn finalizer above
++                    # ever sends end=True, so the reader keeps draining.
++                    _, _sw_voice, _sw_locale = item
++                    if hasattr(live_session, "switch"):
++                        try:
++                            live_session.switch(voice=_sw_voice, locale=_sw_locale)
++                        except Exception as exc:
++                            logger.warning(
++                                "[%s] Live speech: locale switch failed: %s",
++                                self._adapter.name, exc,
++                            )
++                    continue
++                live_session.send_text(item, end=False)
++        except Exception as exc:
++            logger.warning(
++                "[%s] Live speech: sending text to Murf failed: %s",
++                self._adapter.name, exc,
++            )
++        finally:
++            reader.join(timeout=10.0)
++            live_session.close()
++
++    def _run_per_sentence(self) -> None:
++        """Fallback for providers without open_live_session: reconnects
++        for each queued sentence (the original, higher-latency but more
++        broadly compatible path)."""
++        _cur_locale = None
++        while True:
++            sentence = self._queue.get()
++            if sentence is None or self._aborted.is_set():
++                break
++            if isinstance(sentence, tuple) and sentence and sentence[0] == "__switch__":
++                # Fallback path (non-Murf providers): no persistent session
++                # to reconfigure, so just update the voice/locale used for
++                # subsequent per-sentence stream() calls.
++                _, _sw_voice, _sw_locale = sentence
++                if _sw_voice:
++                    self._voice = _sw_voice
++                _cur_locale = _sw_locale or _cur_locale
++                continue
++            try:
++                _stream_extra = {"locale": _cur_locale} if _cur_locale else {}
++                for raw_chunk in self._provider.stream(
++                    sentence, voice=self._voice, model=self._model,
++                    format="pcm", sample_rate=48000, **_stream_extra,
++                ):
++                    if self._aborted.is_set():
++                        break
++                    if not raw_chunk:
++                        continue
++                    self._sink.append(_mono16_to_stereo16(raw_chunk))
++                    if not self._spoke_anything.is_set():
++                        self._spoke_anything.set()
++                        self._start_playback_if_needed()
++            except NotImplementedError:
++                # Provider doesn't support streaming at all — nothing
++                # queued so far either way; stop trying further
++                # sentences in this session.
++                break
++            except Exception as exc:
++                logger.warning(
++                    "[%s] Live speech: streaming synthesis failed for "
++                    "a sentence, skipping it: %s", self._adapter.name, exc,
++                )
++
++    def worker_done(self) -> bool:
++        """True once the producer worker thread has finished. Combined with
++        has_pending_audio() being False, this means playback is truly over.
++        The barge-in watcher owns the session lifecycle off these two signals,
++        NOT the worker's finally block — the worker finishes ~when Murf's
++        front-loaded audio is received, seconds before it's played out."""
++        return not self._worker.is_alive()
++
++    def _start_playback_if_needed(self) -> None:
++        if self._aborted.is_set():
++            return
++        # (Barge-in listening is driven by _barge_in_watch_loop off actual
++        # playback state — see has_pending_audio — not toggled here.)
++        # A mixer child is already live in the continuous mix from the
++        # moment it was created (see DiscordAdapter.start_live_speech) —
++        # nothing to start. Only the non-mixer path owns the single
++        # vc.play() slot and must be started explicitly, once, and that
++        # discord.py call needs to happen on the event loop.
++        if self._mixer is not None or self._playback_started:
++            return
++        self._playback_started = True
++        if self._loop is None:
++            logger.warning(
++                "[%s] Live speech: no event loop captured; cannot start playback",
++                self._adapter.name,
++            )
++            return
++        safe_schedule_threadsafe(
++            self._start_playback(),
++            self._loop,
++            logger=logger,
++            log_message="Live speech playback scheduling failed",
++        )
++
++    async def _start_playback(self) -> None:
++        receiver = self._adapter._voice_receivers.get(self._guild_id)
++        if receiver:
++            # Barge-in on: keep the listener LIVE during playback so an
++            # interruption can be heard (set_barge_in_active was already set in
++            # _start_playback_if_needed). Barge-in off: hard-pause as before.
++            if not self._barge_in:
++                receiver.pause()
++        if self._vc.is_playing():
++            self._vc.stop()
++
++        def _after(error):
++            if error:
++                logger.error("[%s] Live speech playback error: %s", self._adapter.name, error)
++            if receiver and not self._barge_in:
++                receiver.resume()
++
++        self._vc.play(self._sink, after=_after)
++        self._adapter._reset_voice_timeout(self._guild_id)
++
++
+ class VoiceReceiver:
+     """Captures and decodes voice audio from a Discord voice channel.
+ 
+@@ -374,11 +831,31 @@ class VoiceReceiver:
+     # SILENCE_RMS_THRESHOLD used for the local-mic capture path.
+     MIN_SPEECH_RMS = 200
+ 
+-    def __init__(self, voice_client, allowed_user_ids: set = None):
++    # Barge-in (interruption) detection thresholds. Deliberately stricter than
++    # the normal MIN_SPEECH_RMS/duration: a barge-in HALTS the bot mid-reply,
++    # so a false trigger is disruptive. Requiring sustained (~0.6s) speech
++    # above a higher RMS floor rejects short backchannels ("mhm", "yeah" are
++    # ~200-400ms) and stray noise, at the honest cost of ~0.6s detection
++    # latency. See the barge-in research report. Zero external deps (reuses
++    # the same peak-RMS gate as normal capture) — no webrtcvad/silero/torch.
++    BARGE_IN_MIN_DURATION_S = 0.4
++    BARGE_IN_MIN_RMS = 400
++    # An SSRC that hasn't sent a packet within this window is treated as no
++    # longer actively speaking (so a trailing buffer doesn't keep re-triggering).
++    BARGE_IN_ACTIVE_WINDOW_S = 0.4
++
++    def __init__(self, voice_client, allowed_user_ids: set = None, silence_threshold: Optional[float] = None):
+         self._vc = voice_client
+         self._allowed_user_ids = allowed_user_ids or set()
+         self._running = False
+ 
++        # Instance override for the class-default SILENCE_THRESHOLD (config
++        # ``voice.silence_duration`` — previously read only by the CLI/
++        # local-mic path in tools/voice_mode.py, never wired here, so this
++        # class always used the 1.5s hardcoded default regardless of config).
++        if silence_threshold is not None and silence_threshold > 0:
++            self.SILENCE_THRESHOLD = float(silence_threshold)
++
+         # Decryption
+         self._secret_key: Optional[bytes] = None
+         self._dave_session = None
+@@ -398,9 +875,60 @@ class VoiceReceiver:
+         # Pause flag: don't capture while bot is playing TTS
+         self._paused = False
+ 
++        # Barge-in: when True, the bot is playing but the listener stays LIVE
++        # (not hard-paused) so an interruption can be detected. check_barge_in()
++        # only does anything while this is set. Distinct from _paused: _paused
++        # drops packets (used when barge-in is disabled), _barge_in_active keeps
++        # buffering so speech can be detected mid-playback.
++        self._barge_in_active = False
++
+         # Debug logging counter (instance-level to avoid cross-instance races)
+         self._packet_debug_count = 0
+ 
++    # ------------------------------------------------------------------
++    # Barge-in
++    # ------------------------------------------------------------------
++
++    def set_barge_in_active(self, active: bool) -> None:
++        """Enter/leave barge-in listening mode (bot is playing but the
++        listener stays live so an interruption can be detected)."""
++        self._barge_in_active = bool(active)
++
++    def check_barge_in(self) -> Optional[int]:
++        """Return the user_id of a real interrupter, or None.
++
++        Only fires while barge-in mode is active (bot is speaking). A trigger
++        requires SUSTAINED, currently-active speech above a stricter RMS floor
++        — this rejects short backchannels ("mhm"/"yeah") and stray noise. Only
++        considers speakers already MAPPED to a user id (never halts the bot on
++        an unidentified stream — conservative by design). Read-only: does not
++        consume the buffer, so the normal check_silence path still delivers the
++        interrupter's full utterance once they finish."""
++        if not self._barge_in_active:
++            return None
++        now = time.monotonic()
++        with self._lock:
++            items = [(s, bytes(b)) for s, b in self._buffers.items()]
++            ssrc_user = dict(self._ssrc_to_user)
++            last_times = dict(self._last_packet_time)
++        bytes_per_sec = self.SAMPLE_RATE * self.CHANNELS * 2
++        for ssrc, buf in items:
++            user_id = ssrc_user.get(ssrc)
++            if not user_id:  # only halt on an identified speaker
++                continue
++            if self._allowed_user_ids and str(user_id) not in self._allowed_user_ids:
++                continue
++            # Must be actively speaking right now (recent packet), not a stale
++            # trailing buffer.
++            if now - last_times.get(ssrc, 0) > self.BARGE_IN_ACTIVE_WINDOW_S:
++                continue
++            if len(buf) / bytes_per_sec < self.BARGE_IN_MIN_DURATION_S:
++                continue
++            if self._peak_rms(buf, self.CHANNELS) < self.BARGE_IN_MIN_RMS:
++                continue
++            return user_id
++        return None
++
+     # ------------------------------------------------------------------
+     # Lifecycle
+     # ------------------------------------------------------------------
+@@ -630,8 +1158,20 @@ class VoiceReceiver:
+         """Try to infer user_id for an unmapped SSRC.
+ 
+         When the bot rejoins a voice channel, Discord may not resend
+-        SPEAKING events for users already speaking.  If exactly one
+-        allowed user is in the channel, map the SSRC to them.
++        SPEAKING events for users already speaking. Narrow candidates by
++        people *not already mapped to a different SSRC* — not just "exactly
++        one person in the whole channel" — so this still resolves correctly
++        with 2+ participants as long as only one of them is missing a real
++        SPEAKING event. Confirmed necessary live: with two people in the
++        channel, the second speaker's SPEAKING event never arrived across
++        several attempts (including a full Discord client restart), and the
++        original "exactly one candidate in the whole channel" check can
++        never fire again once a second real person joins — even though the
++        first person's mapping (via a real event) already narrows the
++        remaining unknown down to exactly one person.
++
++        Called from check_silence() while holding self._lock — must not
++        re-acquire it here.
+         """
+         try:
+             channel = self._vc.channel
+@@ -888,12 +1428,23 @@ class DiscordAdapter(BasePlatformAdapter):
+         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+         self._voice_text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
+         self._voice_sources: Dict[int, Dict[str, Any]] = {}  # guild_id -> linked text channel source metadata
++        # Per-guild Murf voice override (falls back to MURF_DEFAULT_VOICE /
++        # tts.voice when a guild hasn't picked one). Set via /voice set,
++        # persisted so it survives restarts — each community keeps its own
++        # choice independent of every other server the bot is in.
++        self._voice_selection: Dict[int, str] = self._load_voice_selection()
+         self._voice_timeout_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> timeout task
+         # Phase 2: voice listening
+         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
+         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
++        self._barge_in_watch_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> barge-in watcher
+         self._voice_input_callback: Optional[Callable] = None  # set by run.py
+         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
++        # Barge-in: the guild's currently-playing live-speech session (so the
++        # listen loop can interrupt it) + a callback into the gateway to stash
++        # the interrupted reply. Both only used when barge-in is enabled.
++        self._active_speech_sessions: Dict[int, "LiveSpeechSession"] = {}
++        self._barge_in_callback: Optional[Callable] = None  # set by run.py
+         # Resolves the current voice-reply mode ("off"|"voice_only"|"all") for a
+         # linked text-channel id; set by run.py. Lets the inactivity timer leave
+         # the bot in the channel when the user deliberately picked text-only
+@@ -1271,8 +1822,20 @@ class DiscordAdapter(BasePlatformAdapter):
+                 guild_id = member.guild.id
+                 if guild_id not in bot_guild_ids:
+                     return
+-                # Ignore the bot itself
++                # The bot itself being disconnected (kicked, or a Stage
++                # instance ending, or moved out) is a session-end signal —
++                # route it through the single leave_voice_channel chokepoint so
++                # the recap hook fires. discord.py has no need for a dedicated
++                # on_stage_instance_delete here: a Stage ending disconnects the
++                # bot from the voice channel, which shows up as this transition.
+                 if member == adapter_self._client.user:
++                    bot_left = before.channel is not None and after.channel is None
++                    if bot_left and guild_id in adapter_self._voice_clients:
++                        logger.info("Bot disconnected from voice (guild %d) — ending session", guild_id)
++                        try:
++                            await adapter_self.leave_voice_channel(guild_id)
++                        except Exception as _bl_exc:
++                            logger.debug("bot-left voice cleanup failed: %s", _bl_exc)
+                     return
+ 
+                 joined = before.channel is None and after.channel is not None
+@@ -1538,6 +2101,84 @@ class DiscordAdapter(BasePlatformAdapter):
+ 
+         logger.info("[%s] Disconnected", self.name)
+ 
++    def _voice_selection_path(self) -> _Path:
++        from hermes_constants import get_hermes_home
++
++        directory = get_hermes_home() / _DISCORD_COMMAND_SYNC_STATE_SUBDIR
++        try:
++            directory.mkdir(parents=True, exist_ok=True)
++        except Exception:
++            pass
++        return directory / "discord_voice_selection.json"
++
++    def _load_voice_selection(self) -> Dict[int, str]:
++        try:
++            path = self._voice_selection_path()
++            if not path.exists():
++                return {}
++            data = json.loads(path.read_text(encoding="utf-8"))
++        except Exception:
++            return {}
++        if not isinstance(data, dict):
++            return {}
++        result: Dict[int, str] = {}
++        for guild_id, voice_id in data.items():
++            try:
++                result[int(guild_id)] = str(voice_id)
++            except (TypeError, ValueError):
++                continue
++        return result
++
++    def _save_voice_selection(self) -> None:
++        atomic_json_write(
++            self._voice_selection_path(),
++            {str(gid): voice_id for gid, voice_id in self._voice_selection.items()},
++            indent=2,
++        )
++
++    def get_guild_voice(self, guild_id: int) -> Optional[str]:
++        """Return this guild's chosen Murf voice, or None to use the
++        global default (``MURF_DEFAULT_VOICE`` / ``tts.voice``)."""
++        return self._voice_selection.get(guild_id)
++
++    def set_guild_voice(self, guild_id: int, voice_id: str) -> None:
++        """Persist *voice_id* as this guild's default voice going forward."""
++        self._voice_selection[guild_id] = voice_id
++        self._save_voice_selection()
++
++    def resolve_chat_guild_voice(self, chat_id: str) -> Optional[str]:
++        """Return the persisted Murf voice override for the guild linked
++        to *chat_id*, or None if there's no override (caller should fall
++        back to the global ``tts.voice``/``MURF_DEFAULT_VOICE`` default)
++        or no resolvable guild at all (e.g. a DM).
++
++        Used by the file-based TTS fallback path (auto-TTS when not
++        connected to a live voice channel) — the live-streaming path
++        (``speak_live``/``_resolve_live_speech_target``) already does its
++        own guild resolution, but that path is only reachable while
++        actively connected to voice. Without this, a per-guild voice
++        chosen via ``/voice set`` or the conversational switch marker was
++        silently ignored by every reply delivered as a file attachment
++        instead of live audio — confirmed: it kept using the global
++        default voice regardless of what had just been set.
++        """
++        guild_id = None
++        for gid, tc in self._voice_text_channels.items():
++            if str(tc) == str(chat_id):
++                guild_id = gid
++                break
++        if guild_id is None and self._client is not None:
++            try:
++                channel = self._client.get_channel(int(chat_id))
++                guild = getattr(channel, "guild", None)
++                if guild is not None:
++                    guild_id = guild.id
++            except (TypeError, ValueError, AttributeError):
++                pass
++        if guild_id is None:
++            return None
++        return self._voice_selection.get(guild_id)
++
+     def _command_sync_state_path(self) -> _Path:
+         from hermes_constants import get_hermes_home
+ 
+@@ -2678,6 +3319,261 @@ class DiscordAdapter(BasePlatformAdapter):
+                 return SendResult(success=success)
+         return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
+ 
++    def _resolve_live_speech_target(
++        self, chat_id: str, *, voice_override: Optional[str] = None,
++    ) -> Optional[Dict[str, Any]]:
++        """Resolve everything needed to speak into *chat_id*'s live voice
++        connection, or None if there isn't one / no TTS provider is
++        available. Shared by :meth:`speak_live` (one-shot full text) and
++        :meth:`start_live_speech` (incremental, sentence-at-a-time).
++
++        Voice resolution priority: an explicit *voice_override* (one-off,
++        e.g. ``/voice sample``) wins; otherwise this guild's persisted
++        choice (:meth:`get_guild_voice`, set via ``/voice set``); otherwise
++        the global default (``tts.voice`` / ``MURF_DEFAULT_VOICE``).
++        """
++        if not DISCORD_AVAILABLE:
++            return None
++
++        target_guild_id = None
++        for gid, text_ch_id in self._voice_text_channels.items():
++            if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
++                target_guild_id = gid
++                break
++        if target_guild_id is None:
++            return None
++
++        vc = self._voice_clients.get(target_guild_id)
++        if not vc or not vc.is_connected():
++            return None
++
++        try:
++            from tools.tts_tool import _load_tts_config, _get_provider
++            from agent.tts_registry import get_provider as _get_tts_plugin_provider
++            from hermes_cli.plugins import _ensure_plugins_discovered
++
++            tts_config = _load_tts_config()
++            provider_name = _get_provider(tts_config)
++            _ensure_plugins_discovered()
++            provider = _get_tts_plugin_provider(provider_name)
++            if provider is None:
++                _ensure_plugins_discovered(force=True)
++                provider = _get_tts_plugin_provider(provider_name)
++            if provider is None:
++                return None
++            voice = (
++                voice_override
++                or self._voice_selection.get(target_guild_id)
++                or (tts_config.get("voice") if isinstance(tts_config, dict) else None)
++            )
++            model = tts_config.get("model") if isinstance(tts_config, dict) else None
++        except Exception as exc:
++            logger.debug("[%s] speak_live: provider resolution failed: %s", self.name, exc)
++            return None
++
++        mixer = (
++            self._voice_mixers.get(target_guild_id)
++            if getattr(self, "_voice_mixers", None) else None
++        )
++        return {
++            "guild_id": target_guild_id,
++            "vc": vc,
++            "mixer": mixer,
++            "provider": provider,
++            "voice": voice,
++            "model": model,
++        }
++
++    def start_live_speech(
++        self, chat_id: str, *, voice_override: Optional[str] = None,
++    ) -> Optional["LiveSpeechSession"]:
++        """Open a session to speak sentence-sized chunks of text into a
++        live voice connection as they become available (e.g. from streamed
++        LLM token deltas), instead of waiting for a complete reply.
++
++        *voice_override*, if given, is a one-off Murf voice id used only
++        for this session — it doesn't touch the guild's persisted choice
++        (see ``/voice sample``).
++
++        Returns None immediately (queuing nothing, starting no thread) when
++        there's no live voice connection for this chat or the configured
++        TTS provider isn't available — callers should fall back to the
++        existing full-text ``speak_live``/file-based path in that case.
++        Safe to call from the event loop; the returned session's
++        ``feed_sentence``/``finish`` are thread-safe and meant to be
++        called from whatever thread produces the text (including a
++        non-loop worker thread), matching how ``stream_delta_callback``
++        itself fires.
++        """
++        target = self._resolve_live_speech_target(chat_id, voice_override=voice_override)
++        if target is None:
++            return None
++        try:
++            loop = asyncio.get_running_loop()
++        except RuntimeError:
++            loop = None
++        mixer = target["mixer"]
++        sink = (
++            mixer.play_speech_stream(gain=float(self._voice_fx_cfg.get("speech_gain", 1.0)))
++            if mixer is not None else _LiveTTSAudioSource()
++        )
++        session = LiveSpeechSession(
++            adapter=self,
++            guild_id=target["guild_id"],
++            vc=target["vc"],
++            mixer=mixer,
++            sink=sink,
++            provider=target["provider"],
++            voice=target["voice"],
++            model=target["model"],
++            loop=loop,
++            barge_in=self._barge_in_enabled(),
++        )
++        # Register as the guild's active speech session so the voice-listen
++        # loop can interrupt it on barge-in. Replaces any prior (a new reply
++        # supersedes an old one). Cleared by the session when it ends.
++        if self._barge_in_enabled():
++            self._active_speech_sessions[target["guild_id"]] = session
++        return session
++
++    async def speak_live(
++        self, chat_id: str, text: str, *, voice_override: Optional[str] = None,
++    ) -> bool:
++        """Speak *text* into a live voice/stage connection with minimal
++        latency by streaming audio in as the TTS backend generates it,
++        instead of waiting for a complete file to finish synthesizing
++        before starting playback (the ``play_tts``/``play_in_voice_channel``
++        path always pays that full-clip latency, however low-latency the
++        backend's own streaming API is).
++
++        *voice_override*, if given, is a one-off Murf voice id for just
++        this call — it doesn't touch the guild's persisted choice.
++
++        Returns ``False`` — having queued no audio — when there's no live
++        voice connection for this chat, the configured TTS provider
++        doesn't implement :meth:`TTSProvider.stream`, or nothing arrived
++        from it within a short grace period; callers should fall back to
++        the file-based ``text_to_speech_tool`` + ``play_tts`` path in that
++        case. Once real audio has started queuing, this always returns
++        ``True`` — playback-time errors are logged, not raised.
++        """
++        if not text or not text.strip():
++            return False
++        target = self._resolve_live_speech_target(chat_id, voice_override=voice_override)
++        if target is None:
++            return False
++        target_guild_id = target["guild_id"]
++        vc = target["vc"]
++        provider = target["provider"]
++        voice = target["voice"]
++        model = target["model"]
++        mixer = target["mixer"]
++
++        speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0)) if mixer is not None else 1.0
++        sink = mixer.play_speech_stream(gain=speech_gain) if mixer is not None else _LiveTTSAudioSource()
++
++        started = threading.Event()
++        failed = threading.Event()
++
++        def _produce():
++            # One-off speak_live() calls (SWITCH_VOICE confirmations,
++            # SAMPLE_VOICE previews) open a brand-new streaming connection
++            # every time — unlike the main reply's LiveSpeechSession, which
++            # reuses a single persistent connection for the whole turn.
++            # That connection setup occasionally hits a transient
++            # `_ssl.c:999: The handshake operation timed out` (confirmed in
++            # practice, right after the main reply's own connection had
++            # just been active) — a single quick retry recovers most of
++            # these instead of silently producing no audio at all. Only
++            # retry before any real audio has arrived; a failure mid-stream
++            # is a different problem and shouldn't restart from scratch.
++            attempts = 2
++            for attempt in range(attempts):
++                try:
++                    for raw_chunk in provider.stream(
++                        text, voice=voice, model=model, format="pcm", sample_rate=48000,
++                    ):
++                        if not raw_chunk:
++                            continue
++                        sink.append(_mono16_to_stereo16(raw_chunk))
++                        started.set()
++                    break
++                except NotImplementedError:
++                    failed.set()
++                    break
++                except Exception as exc:
++                    if started.is_set():
++                        logger.warning(
++                            "[%s] speak_live: streaming synthesis failed mid-stream: %s",
++                            self.name, exc,
++                        )
++                        break
++                    if attempt + 1 < attempts:
++                        logger.warning(
++                            "[%s] speak_live: streaming synthesis failed (attempt %d/%d), retrying: %s",
++                            self.name, attempt + 1, attempts, exc,
++                        )
++                        continue
++                    logger.warning("[%s] speak_live: streaming synthesis failed: %s", self.name, exc)
++                    failed.set()
++            sink.close()
++
++        threading.Thread(target=_produce, daemon=True, name="murf-live-tts").start()
++
++        # Wait briefly for either the first real chunk or a hard failure
++        # (unsupported provider, auth error, etc.) so a broken backend can
++        # still fall back to the old file-based path before any audio has
++        # been queued into the live connection — up to ~1s, well under the
++        # multi-second cost of the file-based path this replaces.
++        for _ in range(50):
++            if started.is_set() or failed.is_set():
++                break
++            await asyncio.sleep(0.02)
++
++        if not started.is_set():
++            try:
++                sink.close()
++            except Exception:
++                pass
++            return False
++
++        if mixer is None:
++            receiver = self._voice_receivers.get(target_guild_id)
++            if receiver:
++                receiver.pause()
++
++            # Wait for whatever's currently playing to finish naturally
++            # instead of yanking it. This matters a lot for SAMPLE_VOICE/
++            # SWITCH_VOICE side effects specifically: those call speak_live()
++            # as a follow-up while the main reply's own LiveSpeechSession
++            # may still be actively playing — an unconditional vc.stop()
++            # here cut that reply off mid-word the instant the side effect
++            # fired, which is exactly the "glitchy, repeated audio"
++            # reported in practice. Bounded wait so a genuinely stuck
++            # connection doesn't hang forever.
++            wait_start = time.monotonic()
++            while vc.is_playing():
++                if time.monotonic() - wait_start > 20.0:
++                    logger.warning(
++                        "[%s] Timed out waiting for in-progress playback "
++                        "before speak_live; stopping it", self.name,
++                    )
++                    vc.stop()
++                    break
++                await asyncio.sleep(0.1)
++
++            def _after(error):
++                if error:
++                    logger.error("[%s] Live TTS playback error: %s", self.name, error)
++                if receiver:
++                    receiver.resume()
++
++            vc.play(sink, after=_after)
++
++        logger.info("[%s] Speaking live in voice channel (guild=%d)", self.name, target_guild_id)
++        self._reset_voice_timeout(target_guild_id)
++        return True
++
+     async def send_voice(
+         self,
+         chat_id: str,
+@@ -2769,6 +3665,38 @@ class DiscordAdapter(BasePlatformAdapter):
+     # Voice channel methods (join / leave / play)
+     # ------------------------------------------------------------------
+ 
++    def _configured_voice_silence_duration(self) -> Optional[float]:
++        """Read the top-level ``voice.silence_duration`` config value.
++
++        Previously only consumed by the CLI/local-mic capture path
++        (tools/voice_mode.py); the Discord VoiceReceiver ignored it and
++        always used its hardcoded 1.5s default regardless of what the user
++        configured. Returns None (caller keeps the class default) if unset
++        or invalid.
++        """
++        try:
++            from hermes_cli.config import read_raw_config
++            cfg = read_raw_config() or {}
++            value = (cfg.get("voice") or {}).get("silence_duration")
++            if isinstance(value, (int, float)) and value > 0:
++                return float(value)
++        except Exception as e:
++            logger.debug("Could not load voice.silence_duration config: %s", e)
++        return None
++
++    def _barge_in_enabled(self) -> bool:
++        """Whether barge-in (interrupt the bot by speaking over it) is enabled.
++        Off by default (default-safe): a misfire degrades to current behavior
++        (the bot finishes its sentence) rather than breaking the conversation.
++        Config: ``voice.barge_in.enabled``."""
++        try:
++            from hermes_cli.config import read_raw_config
++            cfg = read_raw_config() or {}
++            bi = (cfg.get("voice") or {}).get("barge_in") or {}
++            return bool(bi.get("enabled", False))
++        except Exception:
++            return False
++
+     def _load_voice_fx_config(self) -> Dict[str, Any]:
+         """Read voice mixer / ambient / ack settings from config.yaml.
+ 
+@@ -2946,12 +3874,28 @@ class DiscordAdapter(BasePlatformAdapter):
+ 
+             # Start voice receiver (Phase 2: listen to users)
+             try:
+-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
++                receiver = VoiceReceiver(
++                    vc,
++                    allowed_user_ids=self._allowed_user_ids,
++                    silence_threshold=self._configured_voice_silence_duration(),
++                )
+                 receiver.start()
+                 self._voice_receivers[guild_id] = receiver
+                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
+                     self._voice_listen_loop(guild_id)
+                 )
++                # Dedicated barge-in watcher: the main listen loop above
++                # BLOCKS while it awaits a completed utterance's full agent
++                # turn (STT + LLM generation), and streaming means the bot is
++                # already speaking during that generation — so barge-in polled
++                # from the main loop can be starved for ~1-2s (measured as ~3s
++                # to interrupt). This independent fast loop only does the
++                # lightweight check_barge_in poll + halt, so interruptions are
++                # detected promptly regardless of what the main loop is doing.
++                if self._barge_in_enabled():
++                    self._barge_in_watch_tasks[guild_id] = asyncio.ensure_future(
++                        self._barge_in_watch_loop(guild_id)
++                    )
+             except Exception as e:
+                 logger.warning("Voice receiver failed to start: %s", e)
+ 
+@@ -2969,6 +3913,19 @@ class DiscordAdapter(BasePlatformAdapter):
+     async def leave_voice_channel(self, guild_id: int) -> None:
+         """Disconnect from the voice channel in a guild."""
+         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
++            # Session-end hook (recap): fire BEFORE state is torn down, so the
++            # callback can still resolve the linked text channel / session. Run
++            # it as a background task so a slow recap (an LLM call) never blocks
++            # the disconnect. Single chokepoint: /voice leave, inactivity
++            # timeout, adapter shutdown, and bot-kick/Stage-end all funnel here.
++            end_cb = getattr(self, "_voice_session_end_callback", None)
++            if end_cb is not None and guild_id in self._voice_clients:
++                text_ch_id = self._voice_text_channels.get(guild_id)
++                try:
++                    asyncio.ensure_future(end_cb(guild_id=guild_id, text_channel_id=text_ch_id))
++                except Exception as _end_exc:
++                    logger.debug("voice session-end callback scheduling failed: %s", _end_exc)
++
+             # Stop voice receiver first
+             receiver = self._voice_receivers.pop(guild_id, None)
+             if receiver:
+@@ -2976,6 +3933,9 @@ class DiscordAdapter(BasePlatformAdapter):
+             listen_task = self._voice_listen_tasks.pop(guild_id, None)
+             if listen_task:
+                 listen_task.cancel()
++            watch_task = self._barge_in_watch_tasks.pop(guild_id, None)
++            if watch_task:
++                watch_task.cancel()
+ 
+             # Tear down the mixer (stops the continuous outgoing stream).
+             if getattr(self, "_voice_mixers", None) is not None:
+@@ -3085,6 +4045,31 @@ class DiscordAdapter(BasePlatformAdapter):
+             return None
+         return member.voice.channel
+ 
++    def resolve_member_name(self, guild_id: int, user_id: int) -> Optional[str]:
++        """Resolve a Discord user_id to their display name in *guild_id*, or
++        None if it can't be resolved confidently.
++
++        Used to attribute spoken transcripts to a real name instead of a
++        raw numeric id. Voice-channel members are populated in the guild
++        cache via voice-state events (no Server Members intent needed for
++        people actually in the channel), so this resolves in the common
++        case; when it can't (member not cached), callers fall back to a
++        neutral "someone" rather than guessing a wrong name.
++        """
++        if not self._client:
++            return None
++        try:
++            guild = self._client.get_guild(int(guild_id))
++            if guild is None:
++                return None
++            member = guild.get_member(int(user_id))
++            if member is None:
++                return None
++            name = getattr(member, "display_name", None) or getattr(member, "name", None)
++            return str(name) if name else None
++        except (TypeError, ValueError, AttributeError):
++            return None
++
+     def _reset_voice_timeout(self, guild_id: int) -> None:
+         """Reset the auto-disconnect inactivity timer."""
+         task = self._voice_timeout_tasks.pop(guild_id, None)
+@@ -3186,17 +4171,137 @@ class DiscordAdapter(BasePlatformAdapter):
+             "speaking_count": len(speaking_user_ids),
+         }
+ 
++    _VOICE_CATALOG_CACHE_TTL = 3600.0  # seconds
++
++    def _get_cached_voice_catalog(self) -> List[Dict[str, Any]]:
++        """Return Murf's voice catalog, cached so injecting voice context
++        into every turn doesn't hit Murf's REST API on every message."""
++        now = time.monotonic()
++        cached = getattr(self, "_voice_catalog_cache", None)
++        if cached is not None:
++            ts, voices = cached
++            if now - ts < self._VOICE_CATALOG_CACHE_TTL:
++                return voices
++        voices: List[Dict[str, Any]] = []
++        try:
++            from tools.tts_tool import _load_tts_config, _get_provider
++            from agent.tts_registry import get_provider as _get_tts_plugin_provider
++            from hermes_cli.plugins import _ensure_plugins_discovered
++
++            tts_config = _load_tts_config()
++            provider_name = _get_provider(tts_config)
++            _ensure_plugins_discovered()
++            provider = _get_tts_plugin_provider(provider_name)
++            if provider is not None and hasattr(provider, "list_voices"):
++                voices = provider.list_voices() or []
++        except Exception as exc:
++            logger.debug("[%s] Voice catalog fetch failed: %s", self.name, exc)
++        self._voice_catalog_cache = (now, voices)
++        return voices
++
++    @staticmethod
++    def _diverse_voice_sample(voices: List[Dict[str, Any]], limit: int = 8) -> List[Dict[str, Any]]:
++        """Pick up to *limit* voices spanning distinct languages first,
++        rather than just the first N (which may all share one locale)."""
++        seen_languages = set()
++        sample = []
++        for v in voices:
++            lang = v.get("language") or ""
++            if lang not in seen_languages:
++                seen_languages.add(lang)
++                sample.append(v)
++            if len(sample) >= limit:
++                return sample
++        for v in voices:
++            if v not in sample:
++                sample.append(v)
++            if len(sample) >= limit:
++                break
++        return sample
++
+     def get_voice_channel_context(self, guild_id: int) -> str:
+         """Return a human-readable voice channel context string.
+ 
+         Suitable for injection into the system/ephemeral prompt so the
+-        agent is always aware of voice channel state.
++        agent is always aware of voice channel state — including real
++        voice-catalog grounding, since without it the model has no idea
++        what voices actually exist and will confidently invent plausible-
++        sounding names instead (confirmed: it suggested/"switched to"
++        voices that don't exist in the real catalog at all).
+         """
+         info = self.get_voice_channel_info(guild_id)
+         if not info:
+             return ""
+ 
+-        parts = [f"[Voice channel: #{info['channel_name']} — {info['member_count']} participant(s)]"]
++        voices = self._get_cached_voice_catalog()
++        current_voice_id = self._voice_selection.get(guild_id) or os.environ.get("MURF_DEFAULT_VOICE", "").strip()
++        current_display = current_voice_id or "(none configured)"
++        sample_names: List[str] = []
++        if voices:
++            by_id = {str(v.get("id", "")).lower(): v for v in voices}
++            cur = by_id.get(str(current_voice_id).lower())
++            if cur:
++                current_display = str(cur.get("display") or cur["id"])
++            sample_names = [
++                str(v.get("display") or v.get("id"))
++                for v in self._diverse_voice_sample(voices, limit=8)
++            ]
++
++        example_name = sample_names[0] if sample_names else "the name"
++
++        voice_lines = [f"Current voice: {current_display}."]
++        if sample_names:
++            remaining = max(0, len(voices) - len(sample_names))
++            voice_lines.append(
++                f"There are {len(voices)} real voices total in this "
++                f"server's catalog — here's just a small sample so you "
++                f"have some names on hand: " + ", ".join(sample_names) + "."
++            )
++        voice_lines.append(
++            "This sample is NOT the full list. If someone names a voice "
++            "that isn't in the sample above, don't assume it's fake — "
++            "still try [[SWITCH_VOICE: <name>]] or [[SAMPLE_VOICE: <name>]] "
++            "with exactly the name they gave you. The switch is checked "
++            "against the real full catalog when it runs, not against this "
++            "sample, so plenty of real names won't be in the few shown "
++            "here. Only refuse a name outright if it's obviously not a "
++            "real voice at all (like a made-up joke name) — a name you "
++            "simply don't recognize is not the same as a fake one, and "
++            "should still be attempted. Never claim a real-sounding name "
++            "\"isn't in the catalog\" just because it wasn't in this "
++            "sample — you have no way to know that without trying."
++        )
++
++        parts = [
++            f"[You are live in Discord voice channel #{info['channel_name']} "
++            f"({info['member_count']} participant(s)) — you can hear speech "
++            f"here in real time (incoming messages are live transcripts) and "
++            f"your text reply is automatically spoken aloud in this channel. "
++            f"Do not call the text_to_speech tool yourself here — it only "
++            f"posts a silent chat attachment and will not be heard live; the "
++            f"platform speaks your reply for you.\n"
++            f"This bot speaks using Murf's Falcon-2 model — an ultra-low-"
++            f"latency (~130ms) streaming TTS model, which is why you can "
++            f"speak here in real time. Falcon-2 is the default and the "
++            f"main thing to talk about; only bring up Gen2 (Murf's other, "
++            f"higher-latency but more customizable model, trained on "
++            f"70,000+ hours of studio recordings) if someone specifically "
++            f"asks about it or about offline/non-realtime synthesis "
++            f"quality — don't recommend it by default.\n"
++            + "\n".join(voice_lines) + "\n"
++            f"If someone asks you (in plain conversation) to switch, "
++            f"change, or use a different voice going forward, you MUST put "
++            f"[[SWITCH_VOICE: <exact name from above>]] literally in your "
++            f"reply text IN ADDITION to whatever you say out loud — e.g. "
++            f"say \"Switching to {example_name} now.\" AND separately "
++            f"include [[SWITCH_VOICE: {example_name}]]. Without that exact "
++            f"tag nothing actually changes, even though your spoken words "
++            f"would claim it did — never say a switch happened unless "
++            f"you're including the tag. For a one-off preview instead of "
++            f"a permanent switch, use [[SAMPLE_VOICE: <name>]] the same "
++            f"way. Always put the tag at the very end of your reply, "
++            f"never in the middle.]"
++        ]
+         for m in info["members"]:
+             status = " (speaking)" if m["is_speaking"] else ""
+             parts.append(f"  - {m['display_name']}{status}")
+@@ -3233,6 +4338,9 @@ class DiscordAdapter(BasePlatformAdapter):
+                     except Exception:
+                         pass
+ 
++                # (Barge-in is polled by the dedicated _barge_in_watch_loop,
++                # not here — this loop blocks on _process_voice_input below and
++                # would starve detection during a reply.)
+                 completed = receiver.check_silence()
+                 # Voice inputs always originate from a specific guild
+                 # (guild_id is in scope). Pass it so role checks are
+@@ -3256,6 +4364,74 @@ class DiscordAdapter(BasePlatformAdapter):
+         except Exception as e:
+             logger.error("Voice listen loop error: %s", e, exc_info=True)
+ 
++    async def _barge_in_watch_loop(self, guild_id: int):
++        """Dedicated fast poller for barge-in, independent of the main voice
++        listen loop (which blocks on each utterance's full agent turn). Polls
++        every 100ms; check_barge_in is a no-op unless the bot is actively
++        speaking, so this is cheap. This is what makes interruption detection
++        prompt (~0.5s) instead of being starved to ~3s by the main loop."""
++        receiver = self._voice_receivers.get(guild_id)
++        if not receiver:
++            return
++        try:
++            while receiver._running:
++                await asyncio.sleep(0.1)
++                # Gate detection on ACTUAL playback: the bot is "speaking" only
++                # while the active session's sink still has un-played audio.
++                # This is the fix for barge-in never firing — the session's
++                # worker thread clears its own flag ~when Murf's front-loaded
++                # audio is received, which is seconds BEFORE playback ends, so
++                # the old flag was False for most of the real speaking window.
++                session = self._active_speech_sessions.get(guild_id)
++                if session is None:
++                    receiver.set_barge_in_active(False)
++                    continue
++                speaking = (
++                    not session._aborted.is_set()
++                    and session.has_pending_audio()
++                )
++                receiver.set_barge_in_active(speaking)
++                if speaking:
++                    interrupter = receiver.check_barge_in()
++                    if interrupter is not None:
++                        await self._handle_barge_in(guild_id, interrupter)
++                elif session._aborted.is_set() or session.worker_done():
++                    # Playback truly over (drained + worker finished) or
++                    # aborted — retire this session so a later normal
++                    # utterance isn't mistaken for an interruption.
++                    if self._active_speech_sessions.get(guild_id) is session:
++                        self._active_speech_sessions.pop(guild_id, None)
++        except asyncio.CancelledError:
++            pass
++        except Exception as e:
++            logger.debug("Barge-in watch loop error: %s", e)
++
++    async def _handle_barge_in(self, guild_id: int, user_id: int) -> None:
++        """Halt the bot's in-progress reply because *user_id* interrupted.
++
++        Order: interrupt the active session (Murf clear + local flush + stop
++        playback — see LiveSpeechSession.interrupt), leave barge-in mode, then
++        notify the gateway to stash the interrupted reply so the next turn can
++        decide to repeat/continue/drop. The interrupter's own utterance is NOT
++        consumed here — it keeps buffering and is delivered by the normal
++        check_silence path once they finish."""
++        logger.info("Barge-in: user %s interrupted the reply (guild %d) — halting", user_id, guild_id)
++        session = self._active_speech_sessions.pop(guild_id, None)
++        if session is not None:
++            try:
++                session.interrupt()
++            except Exception as exc:
++                logger.debug("Barge-in interrupt failed: %s", exc)
++        receiver = self._voice_receivers.get(guild_id)
++        if receiver is not None:
++            receiver.set_barge_in_active(False)
++        cb = self._barge_in_callback
++        if cb is not None:
++            try:
++                await cb(guild_id=guild_id, user_id=user_id)
++            except Exception as exc:
++                logger.debug("Barge-in gateway callback failed: %s", exc)
++
+     async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes):
+         """Convert PCM -> WAV -> STT -> callback."""
+         from tools.voice_mode import is_whisper_hallucination
+@@ -4247,8 +5423,11 @@ class DiscordAdapter(BasePlatformAdapter):
+         async def slash_reload_skills(interaction: discord.Interaction):
+             await self._run_simple_slash(interaction, "/reload-skills")
+ 
+-        @tree.command(name="voice", description="Toggle voice reply mode")
+-        @discord.app_commands.describe(mode="Voice mode: join, channel, leave, on, tts, off, or status")
++        @tree.command(name="voice", description="Toggle voice reply mode, or manage the Murf voice")
++        @discord.app_commands.describe(
++            mode="Voice mode: join, channel, leave, on, tts, off, status, list, set, sample",
++            query="For list/set/sample: a voice name or ID (sample also takes optional text after it)",
++        )
+         @discord.app_commands.choices(mode=[
+             # `join` and `channel` both route to _handle_voice_channel_join in
+             # gateway/run.py — expose both in the slash UI so autocomplete
+@@ -4261,9 +5440,12 @@ class DiscordAdapter(BasePlatformAdapter):
+             discord.app_commands.Choice(name="tts — voice reply to all messages", value="tts"),
+             discord.app_commands.Choice(name="off — text only", value="off"),
+             discord.app_commands.Choice(name="status — show current mode", value="status"),
++            discord.app_commands.Choice(name="list — browse/search Murf voices", value="list"),
++            discord.app_commands.Choice(name="set — make a voice this server's default", value="set"),
++            discord.app_commands.Choice(name="sample — preview a voice without changing anything", value="sample"),
+         ])
+-        async def slash_voice(interaction: discord.Interaction, mode: str = ""):
+-            await self._run_simple_slash(interaction, f"/voice {mode}".strip())
++        async def slash_voice(interaction: discord.Interaction, mode: str = "", query: str = ""):
++            await self._run_simple_slash(interaction, f"/voice {mode} {query}".strip())
+ 
+         @tree.command(name="update", description="Update Hermes Agent to the latest version")
+         async def slash_update(interaction: discord.Interaction):
+@@ -5427,14 +6609,39 @@ class DiscordAdapter(BasePlatformAdapter):
+             thread_name = thread_name[:77] + "..."
+         return thread_name
+ 
++    @staticmethod
++    def _rate_limit_retry_after(exc: Exception) -> Optional[float]:
++        """Return Discord's ``Retry-After`` seconds if *exc* is a 429, else None.
++
++        Covers both ``discord.HTTPException`` (``.status == 429``, with
++        ``.retry_after`` populated by discord.py's rate-limit handling) and
++        ``discord.RateLimited`` (raised directly when a request would
++        exceed a known bucket, also carrying ``.retry_after``).
++        """
++        retry_after = getattr(exc, "retry_after", None)
++        if isinstance(retry_after, (int, float)):
++            return float(retry_after)
++        if getattr(exc, "status", None) == 429:
++            return 0.0
++        return None
++
+     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
+         """Create a thread from a user message for auto-threading.
+ 
+-        Returns the created thread object, or ``None`` on failure. Both the
++        Returns the created thread object, or ``None`` on failure. The
+         primary ``message.create_thread`` and the seed-message fallback are
+         retried once after a short backoff so transient connect errors
+         (e.g. ``Cannot connect to host discord.com:443``) don't immediately
+         burn through to the caller's failure path (#20243).
++
++        A 429 is treated as terminal rather than retried: the fallback path
++        (seed message + ``create_thread`` on it) hits the same per-channel
++        thread-creation rate-limit bucket as the direct attempt, so trying
++        it — or retrying at all — cannot succeed before Discord's cooldown
++        (commonly minutes) elapses. Retrying anyway previously burned up to
++        4 thread-creation calls per inbound message and left orphaned
++        "Thread created by Hermes" seed messages in the channel with no
++        thread behind them once the fallback also got rate-limited.
+         """
+         thread_name = self._derive_auto_thread_name(message.content or "")
+         display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
+@@ -5453,6 +6660,15 @@ class DiscordAdapter(BasePlatformAdapter):
+                 return thread
+             except Exception as direct_error:
+                 last_direct_error = direct_error
++                retry_after = self._rate_limit_retry_after(direct_error)
++                if retry_after is not None:
++                    logger.warning(
++                        "[%s] Thread creation rate-limited (retry_after=%.1fs); "
++                        "skipping fallback and retry — they'd hit the same "
++                        "bucket. Error: %s",
++                        self.name, retry_after, direct_error,
++                    )
++                    break
+                 try:
+                     seed_msg = await message.channel.send(
+                         f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
+@@ -5469,6 +6685,14 @@ class DiscordAdapter(BasePlatformAdapter):
+                     return thread
+                 except Exception as fallback_error:
+                     last_fallback_error = fallback_error
++                    fallback_retry_after = self._rate_limit_retry_after(fallback_error)
++                    if fallback_retry_after is not None:
++                        logger.warning(
++                            "[%s] Fallback thread creation rate-limited "
++                            "(retry_after=%.1fs); giving up. Error: %s",
++                            self.name, fallback_retry_after, fallback_error,
++                        )
++                        break
+                     if attempt == 0:
+                         # Brief backoff before the second attempt — most failures
+                         # in this path are transient connect errors that recover
+diff --git a/plugins/platforms/discord/voice_mixer.py b/plugins/platforms/discord/voice_mixer.py
+index a01fd82..00e149c 100644
+--- a/plugins/platforms/discord/voice_mixer.py
++++ b/plugins/platforms/discord/voice_mixer.py
+@@ -145,6 +145,93 @@ class MixerChild:
+         return samples
+ 
+ 
++class StreamingMixerChild:
++    """A speech child fed incrementally as audio arrives, instead of
++    :class:`MixerChild`'s fixed-at-construction buffer.
++
++    Built for live-streaming TTS: ``append()`` is called from a producer
++    thread (e.g. a Falcon/streaming-TTS websocket) as chunks arrive, while
++    :meth:`read_frame` is polled every 20ms from discord.py's audio sender
++    thread, same as ``MixerChild``. A frame slot with nothing buffered yet
++    returns silence rather than ending the child — the producer may still
++    be mid-flight — so a brief stall never drops the reply; only an
++    explicit :meth:`close` with a fully drained buffer ends it.
++    """
++
++    __slots__ = ("gain", "fade_frames", "_fade_done", "_lock", "_buf", "_pos", "_done")
++
++    def __init__(self, *, gain: float = 1.0, fade_in_ms: int = 40):
++        self.gain = float(gain)
++        self.fade_frames = max(0, fade_in_ms // FRAME_LENGTH_MS)
++        self._fade_done = 0
++        self._lock = threading.Lock()
++        self._buf = bytearray()
++        self._pos = 0
++        self._done = False
++
++    def append(self, stereo_pcm: bytes) -> None:
++        """Append already-stereo 48kHz s16le PCM bytes."""
++        if not stereo_pcm:
++            return
++        with self._lock:
++            self._buf.extend(stereo_pcm)
++
++    def close(self) -> None:
++        """Signal that no more audio is coming; the tail drains then finishes."""
++        with self._lock:
++            self._done = True
++
++    def flush(self) -> None:
++        """Drop all un-played audio immediately (barge-in) and end the child.
++
++        The streaming TTS backend (Murf Falcon) delivers audio several
++        seconds ahead of real time, so this buffer holds what the bot would
++        otherwise keep speaking after an interrupt. Clearing it is what makes
++        the bot actually go quiet fast; ``read_frame`` then returns None and
++        the mixer drops this child."""
++        with self._lock:
++            self._buf = bytearray()
++            self._pos = 0
++            self._done = True
++
++    def pending_bytes(self) -> int:
++        """Un-played audio still buffered — >0 means this child is audibly
++        playing right now. Gates barge-in detection to the real playback
++        window (Murf front-loads ~4s, so the producer finishes long before
++        playback does)."""
++        with self._lock:
++            return max(0, len(self._buf) - self._pos)
++
++    def read_frame(self) -> "Optional[np.ndarray]":
++        """Return the next 20ms frame, or None once fully drained and closed."""
++        with self._lock:
++            available = len(self._buf) - self._pos
++            if available >= FRAME_SIZE:
++                chunk = bytes(self._buf[self._pos:self._pos + FRAME_SIZE])
++                self._pos += FRAME_SIZE
++            elif self._done:
++                if available <= 0:
++                    return None
++                chunk = bytes(self._buf[self._pos:]) + b"\x00" * (FRAME_SIZE - available)
++                self._pos = len(self._buf)
++            else:
++                # Producer hasn't caught up yet — hold this slot with
++                # silence instead of evicting the child; more audio may
++                # still be appended on the next read.
++                np = _require_numpy()
++                return np.zeros(FRAME_SIZE // 2, dtype=np.float32)
++
++        np = _require_numpy()
++        samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
++        gain = self.gain
++        if self.fade_frames and self._fade_done < self.fade_frames:
++            self._fade_done += 1
++            gain *= self._fade_done / self.fade_frames
++        if gain != 1.0:
++            samples = samples * gain
++        return samples
++
++
+ class VoiceMixer:
+     """A continuous ``discord.AudioSource`` that mixes N child streams.
+ 
+@@ -222,6 +309,28 @@ class VoiceMixer:
+             if self._ambient is not None:
+                 self._ambient.gain = self._duck_gain
+ 
++    def play_speech_stream(self, *, gain: Optional[float] = None,
++                            fade_in_ms: int = 40) -> StreamingMixerChild:
++        """Start a speech child fed incrementally via the returned handle's
++        ``append()``/``close()``, instead of a single complete PCM blob.
++
++        Ducks the ambient bed exactly like :meth:`play_speech`. Lets a
++        streaming TTS backend (e.g. a low-latency websocket) start playing
++        audio as it arrives instead of waiting for the whole reply to
++        finish synthesizing first.
++        """
++        child = StreamingMixerChild(
++            gain=self._speech_gain if gain is None else float(gain),
++            fade_in_ms=fade_in_ms,
++        )
++        with self._lock:
++            self._speech.append(child)
++            self._speech_active = True
++            self._duck_release_left = 0
++            if self._ambient is not None:
++                self._ambient.gain = self._duck_gain
++        return child
++
+     @property
+     def speech_active(self) -> bool:
+         with self._lock:

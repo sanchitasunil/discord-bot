@@ -1,0 +1,38 @@
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index 8257ccb..91a22d7 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -1534,7 +2231,19 @@ class DiscordAdapter(BasePlatformAdapter):
+         if retry_after_until > now:
+             remaining = max(1, int(retry_after_until - now))
+             return f"Discord asked us to wait before syncing slash commands; retry in {remaining}s"
+-        if entry.get("fingerprint") == fingerprint and entry.get("last_success_at"):
++        # Compare against succeeded_fingerprint specifically — NOT the
++        # generic `fingerprint` field, which _record_command_sync_attempt
++        # overwrites the moment a sync is attempted, before it's known to
++        # succeed. Checking `fingerprint == desired and last_success_at`
++        # (the old logic) meant a sync that threw partway through — leaving
++        # a fresh fingerprint but no fresh success — would look identical
++        # to a real success on every subsequent restart, silently skipping
++        # forever even though the change was never actually applied to
++        # Discord. Confirmed happening in practice: an attempt was recorded
++        # ~24h after the last real success, with the old summary still
++        # attached — the sync never got a chance to fail loudly or retry,
++        # it just looked "already done" from then on.
++        if entry.get("succeeded_fingerprint") == fingerprint:
+             return "same slash-command fingerprint already synced"
+         return None
+ 
+@@ -1571,6 +2280,12 @@ class DiscordAdapter(BasePlatformAdapter):
+         state = self._read_command_sync_state()
+         state[self._command_sync_state_key(app_id)] = {
+             "fingerprint": fingerprint,
++            # Only ever set here, on genuine success — this is what
++            # _command_sync_skip_reason checks, specifically so a failed
++            # attempt (which only updates `fingerprint`/`last_attempt_at`
++            # via _record_command_sync_attempt) can never masquerade as
++            # "already synced" on a later restart.
++            "succeeded_fingerprint": fingerprint,
+             "last_attempt_at": time.time(),
+             "last_success_at": time.time(),
+             "summary": summary,

@@ -1,0 +1,47 @@
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index 8257ccb..91a22d7 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -632,23 +1179,29 @@ class VoiceReceiver:
+                 return 0
+             bot_id = self._vc.user.id if self._vc.user else 0
+             allowed = self._allowed_user_ids
++            already_mapped = set(self._ssrc_to_user.values())
+             candidates = [
+                 m.id for m in channel.members
+-                if m.id != bot_id and (not allowed or str(m.id) in allowed)
++                if m.id != bot_id
++                and (not allowed or str(m.id) in allowed)
++                and m.id not in already_mapped
+             ]
+             if len(candidates) == 1:
+                 uid = candidates[0]
+                 self._ssrc_to_user[ssrc] = uid
+-                logger.info("Auto-mapped ssrc=%d -> user=%d (sole allowed member)", ssrc, uid)
++                logger.info(
++                    "Auto-mapped ssrc=%d -> user=%d (sole remaining unmapped member)",
++                    ssrc, uid,
++                )
+                 return uid
+         except Exception:
+             pass
+         return 0
+ 
+     def check_silence(self) -> list:
+-        """Return list of (user_id, pcm_bytes) for completed utterances."""
++        """Return list of (user_id, pcm_bytes) for completed, non-silent utterances."""
+         now = time.monotonic()
+-        completed = []
++        candidates = []
+ 
+         with self._lock:
+             ssrc_user_map = dict(self._ssrc_to_user)
+@@ -668,7 +1221,7 @@ class VoiceReceiver:
+                         # Infer from allowed users in the voice channel.
+                         user_id = self._infer_user_for_ssrc(ssrc)
+                     if user_id:
+-                        completed.append((user_id, bytes(buf)))
++                        candidates.append((user_id, bytes(buf)))
+                     self._buffers[ssrc] = bytearray()
+                     self._last_packet_time.pop(ssrc, None)
+                 elif silence_duration >= self.SILENCE_THRESHOLD * 2:

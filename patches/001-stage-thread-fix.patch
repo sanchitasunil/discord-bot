@@ -1,0 +1,18 @@
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index 8257ccb..91a22d7 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -6293,7 +7591,12 @@ class DiscordAdapter(BasePlatformAdapter):
+         if not is_thread and not isinstance(message.channel, discord.DMChannel):
+             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
+             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
+-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
++            # Stage channel chat cannot host threads at all (Discord rejects
++            # create_thread with 400/50024 "Cannot execute action on this
++            # channel type" — this is permanent, not a transient failure, so
++            # auto-threading must never be attempted here).
++            is_stage_channel = getattr(message.channel, "type", None) == discord.ChannelType.stage_voice
++            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel or is_stage_channel
+             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
+             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
+             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
